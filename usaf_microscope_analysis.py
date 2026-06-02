@@ -7,7 +7,8 @@ Main modes
 1. stripe
    Analyze one manually selected USAF 1951 stripe/bar ROI.
    If --orientation is omitted, the code automatically detects whether the ROI
-   contains vertical or horizontal bars.
+   contains vertical or horizontal bars. The selected 1D PSF model is fit
+   directly to an ideal finite three-bar object convolved with that PSF.
 
 2. auto-stripes
    Automatically detect multiple USAF stripe triplets in an image, then run the
@@ -23,6 +24,26 @@ Dependencies
 ------------
 pip install numpy scipy matplotlib pandas tifffile
 
+Stripe PSF models
+-----------------
+gaussian
+    Fit a Gaussian line-spread function. Report sigma and the RMS-matched
+    Rayleigh-equivalent resolution:
+
+        resolution = 2.898785 * sigma
+
+airy
+    Fit a 1D Airy kernel. Report r0, the Airy first-zero radius and
+    Rayleigh-style resolution.
+
+both
+    Fit and plot both models for comparison.
+
+When USAF group/element or lp/mm and object-space calibration are available,
+the bar width is fixed automatically to the nominal USAF value. Otherwise the
+width is fitted, unless --convolution-width-px or --fix-convolution-width is
+used. See USAF_MICROSCOPE_ANALYSIS.md for details.
+
 Example usage
 -------------
 Manual stripe analysis:
@@ -33,6 +54,7 @@ Manual stripe analysis:
         --element 2 \
         --pixel-size-um 6.5 \
         --magnification 10 \
+        --psf-model gaussian \
         --outdir stripe_G6E2
 
 Automatic stripe detection:
@@ -42,6 +64,7 @@ Automatic stripe detection:
         --polarity dark \
         --pixel-size-um 6.5 \
         --magnification 10 \
+        --psf-model airy \
         --outdir auto_usaf
 
 Edge analysis:
@@ -81,9 +104,12 @@ from scipy.ndimage import (
     label,
     rotate,
 )
-from scipy.optimize import curve_fit
-from scipy.signal import find_peaks
-from scipy.special import erf
+from scipy.optimize import curve_fit, least_squares
+from scipy.signal import fftconvolve, find_peaks
+from scipy.special import erf, j1
+
+
+GAUSSIAN_RAYLEIGH_EQUIVALENT_FACTOR = 2.898785
 
 
 # ============================================================
@@ -200,9 +226,22 @@ def pick_roi_interactive(
 
     state: Dict[str, Optional[Tuple[int, int, int, int]]] = {"roi": None}
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    ax.imshow(img, cmap="gray", origin="upper")
-    ax.set_title(title + "\nDraw rectangle, then close the window.")
+    fig, ax = plt.subplots(figsize=(11, 8))
+    finite_pixels = img[np.isfinite(img)]
+    if finite_pixels.size > 0:
+        lo, hi = np.percentile(finite_pixels, [1, 99])
+    else:
+        lo, hi = 0.0, 1.0
+    if hi <= lo:
+        lo, hi = None, None
+    ax.imshow(img, cmap="gray", origin="upper", vmin=lo, vmax=hi)
+    ax.set_title(
+        title
+        + "\nScroll to zoom, right-drag to pan, draw ROI with left mouse. "
+        + "Press Enter when done."
+    )
+    initial_xlim = ax.get_xlim()
+    initial_ylim = ax.get_ylim()
 
     def onselect(eclick, erelease):
         x1, y1 = eclick.xdata, eclick.ydata
@@ -222,16 +261,96 @@ def pick_roi_interactive(
         state["roi"] = (x0, y0, w, h)
         print(f"Selected ROI: x={x0}, y={y0}, w={w}, h={h}")
 
-    _selector = RectangleSelector(
-        ax,
-        onselect,
-        useblit=True,
-        button=[1],
-        minspanx=5,
-        minspany=5,
-        spancoords="pixels",
-        interactive=True,
-    )
+    selector_kwargs = {
+        "useblit": True,
+        "button": [1],
+        "minspanx": 2,
+        "minspany": 2,
+        "spancoords": "pixels",
+        "interactive": True,
+        "props": {
+            "facecolor": "none",
+            "edgecolor": "tab:red",
+            "linewidth": 0.8,
+            "alpha": 0.95,
+        },
+        "handle_props": {
+            "markeredgecolor": "tab:red",
+            "markerfacecolor": "white",
+            "markersize": 4,
+            "markeredgewidth": 0.8,
+        },
+    }
+
+    try:
+        _selector = RectangleSelector(ax, onselect, **selector_kwargs)
+    except TypeError:
+        # Older matplotlib versions used rectprops instead of props and may not
+        # accept handle styling.
+        selector_kwargs["rectprops"] = selector_kwargs.pop("props")
+        selector_kwargs.pop("handle_props", None)
+        _selector = RectangleSelector(ax, onselect, **selector_kwargs)
+
+    pan_state: Dict[str, object] = {"press": None}
+
+    def on_scroll(event):
+        if event.inaxes != ax or event.xdata is None or event.ydata is None:
+            return
+
+        scale = 1.0 / 1.5 if event.button == "up" else 1.5
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        x_width = (xlim[1] - xlim[0]) * scale
+        y_height = (ylim[1] - ylim[0]) * scale
+        x_rel = (event.xdata - xlim[0]) / (xlim[1] - xlim[0])
+        y_rel = (event.ydata - ylim[0]) / (ylim[1] - ylim[0])
+
+        ax.set_xlim(event.xdata - x_width * x_rel, event.xdata + x_width * (1 - x_rel))
+        ax.set_ylim(event.ydata - y_height * y_rel, event.ydata + y_height * (1 - y_rel))
+        fig.canvas.draw_idle()
+
+    def on_button_press(event):
+        if event.inaxes == ax and event.button == 3:
+            pan_state["press"] = (
+                event.xdata,
+                event.ydata,
+                ax.get_xlim(),
+                ax.get_ylim(),
+            )
+
+    def on_motion(event):
+        press = pan_state.get("press")
+        if press is None or event.inaxes != ax or event.xdata is None or event.ydata is None:
+            return
+
+        x_press, y_press, xlim, ylim = press
+        dx = event.xdata - x_press
+        dy = event.ydata - y_press
+        ax.set_xlim(xlim[0] - dx, xlim[1] - dx)
+        ax.set_ylim(ylim[0] - dy, ylim[1] - dy)
+        fig.canvas.draw_idle()
+
+    def on_button_release(event):
+        if event.button == 3:
+            pan_state["press"] = None
+
+    def on_key(event):
+        if event.key in ("enter", "return") and state["roi"] is not None:
+            plt.close(fig)
+        elif event.key in ("escape", "backspace"):
+            state["roi"] = None
+            _selector.set_visible(False)
+            fig.canvas.draw_idle()
+        elif event.key == "r":
+            ax.set_xlim(initial_xlim)
+            ax.set_ylim(initial_ylim)
+            fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("scroll_event", on_scroll)
+    fig.canvas.mpl_connect("button_press_event", on_button_press)
+    fig.canvas.mpl_connect("motion_notify_event", on_motion)
+    fig.canvas.mpl_connect("button_release_event", on_button_release)
+    fig.canvas.mpl_connect("key_press_event", on_key)
 
     plt.show()
 
@@ -315,17 +434,155 @@ def resolution_from_lpmm(lpmm: float) -> Dict[str, float]:
     }
 
 
-def extract_bar_profile(crop: np.ndarray, orientation: str) -> np.ndarray:
+def nominal_bar_width_px_from_lpmm(
+    lpmm: Optional[float],
+    calibration: Optional[CameraCalibration],
+) -> float:
+    """Return the nominal USAF bar width in image pixels when calibration allows it."""
+    if lpmm is None or not np.isfinite(lpmm) or lpmm <= 0:
+        return np.nan
+    if calibration is None or calibration.object_pixel_um is None:
+        return np.nan
+
+    obj_px_um = calibration.object_pixel_um
+    if not np.isfinite(obj_px_um) or obj_px_um <= 0:
+        return np.nan
+
+    line_pair_period_um = 1000.0 / lpmm
+    return line_pair_period_um / (2.0 * obj_px_um)
+
+
+def width_bounds_around_nominal(
+    nominal_w_px: float,
+    tolerance_fraction: float = 0.20,
+) -> Optional[Tuple[float, float]]:
+    """Build conservative bounds around a known/nominal bar width."""
+    if not np.isfinite(nominal_w_px) or nominal_w_px <= 0:
+        return None
+
+    tolerance = max(0.25, tolerance_fraction * nominal_w_px)
+    lower = max(0.5, nominal_w_px - tolerance)
+    upper = nominal_w_px + tolerance
+    if upper <= lower:
+        upper = lower + max(0.25, 0.1 * nominal_w_px)
+    return float(lower), float(upper)
+
+
+def extract_bar_profile(
+    crop: np.ndarray,
+    orientation: str,
+    averaging_band: Optional[Tuple[int, int]] = None,
+) -> np.ndarray:
     """
     orientation:
     - "vertical": vertical bars, intensity varies along x.
     - "horizontal": horizontal bars, intensity varies along y.
     """
     if orientation == "vertical":
+        if averaging_band is not None:
+            y0, y1 = averaging_band
+            crop = crop[y0:y1, :]
         return crop.mean(axis=0)
     if orientation == "horizontal":
+        if averaging_band is not None:
+            x0, x1 = averaging_band
+            crop = crop[:, x0:x1]
         return crop.mean(axis=1)
     raise ValueError("orientation must be 'vertical' or 'horizontal'")
+
+
+def _longest_true_run(mask: np.ndarray) -> Optional[Tuple[int, int]]:
+    """Return [start, end) for the longest contiguous True run."""
+    mask = np.asarray(mask, dtype=bool)
+    if not np.any(mask):
+        return None
+
+    padded = np.concatenate(([False], mask, [False]))
+    changes = np.diff(padded.astype(int))
+    starts = np.flatnonzero(changes == 1)
+    ends = np.flatnonzero(changes == -1)
+    lengths = ends - starts
+    idx = int(np.argmax(lengths))
+    return int(starts[idx]), int(ends[idx])
+
+
+def estimate_stripe_averaging_band(
+    crop: np.ndarray,
+    orientation: str,
+    min_fraction: float = 0.12,
+    padding_px: int = 0,
+    threshold_fraction: float = 0.55,
+) -> Dict[str, object]:
+    """
+    Find the part of the ROI to average along the stripe direction.
+
+    Rows/columns that are outside the stripe bars tend to have little variation
+    across the bars and gaps. Trimming them avoids diluting the profile with
+    surrounding dark/background area.
+    """
+    if orientation == "vertical":
+        axis_length = crop.shape[0]
+        variation = np.percentile(crop, 90, axis=1) - np.percentile(crop, 10, axis=1)
+        band_axis = "y"
+    elif orientation == "horizontal":
+        axis_length = crop.shape[1]
+        variation = np.percentile(crop, 90, axis=0) - np.percentile(crop, 10, axis=0)
+        band_axis = "x"
+    else:
+        raise ValueError("orientation must be 'vertical' or 'horizontal'")
+
+    if axis_length <= 4 or not np.any(np.isfinite(variation)):
+        return {
+            "band": (0, axis_length),
+            "band_axis": band_axis,
+            "band_fraction": 1.0,
+            "trim_applied": False,
+        }
+
+    variation = np.nan_to_num(variation.astype(float), nan=0.0)
+    smooth_sigma = max(0.75, min(3.0, axis_length / 80.0))
+    smoothed = gaussian_filter1d(variation, sigma=smooth_sigma)
+
+    lo = float(np.percentile(smoothed, 20))
+    hi = float(np.percentile(smoothed, 90))
+    if hi <= lo:
+        return {
+            "band": (0, axis_length),
+            "band_axis": band_axis,
+            "band_fraction": 1.0,
+            "trim_applied": False,
+        }
+
+    threshold = lo + threshold_fraction * (hi - lo)
+    mask = smoothed >= threshold
+    run = _longest_true_run(mask)
+
+    if run is None:
+        band = (0, axis_length)
+    else:
+        start, end = run
+        start = max(0, start - padding_px)
+        end = min(axis_length, end + padding_px)
+        band = (start, end)
+
+    min_len = max(3, int(round(min_fraction * axis_length)))
+    if band[1] - band[0] < min_len:
+        center = int(np.argmax(smoothed))
+        half = max(1, min_len // 2)
+        start = max(0, center - half)
+        end = min(axis_length, start + min_len)
+        start = max(0, end - min_len)
+        band = (start, end)
+
+    fraction = (band[1] - band[0]) / float(axis_length)
+    trim_applied = band != (0, axis_length)
+
+    return {
+        "band": band,
+        "band_axis": band_axis,
+        "band_fraction": fraction,
+        "trim_applied": trim_applied,
+    }
 
 
 def remove_slow_background(
@@ -353,29 +610,6 @@ def remove_slow_background(
 
     corrected = y / bg * np.mean(bg)
     return corrected
-
-
-def michelson_contrast(
-    profile: np.ndarray,
-    smooth_sigma: float = 1.0,
-    percentile_low: float = 10,
-    percentile_high: float = 90,
-) -> float:
-    """
-    Robust Michelson contrast using percentiles rather than raw max/min.
-
-        C = (Imax - Imin) / (Imax + Imin)
-    """
-    p = gaussian_filter1d(profile.astype(float), smooth_sigma)
-
-    Imax = np.percentile(p, percentile_high)
-    Imin = np.percentile(p, percentile_low)
-
-    denom = Imax + Imin
-    if denom == 0:
-        return np.nan
-
-    return abs((Imax - Imin) / denom)
 
 
 def estimate_period_fft(profile: np.ndarray) -> float:
@@ -409,59 +643,912 @@ def estimate_period_fft(profile: np.ndarray) -> float:
     return 1.0 / freq_peak
 
 
-def fit_sine_fixed_period(
-    profile: np.ndarray,
-    period_px: float,
-) -> Dict[str, object]:
+def blurred_bar_profile(
+    x: np.ndarray,
+    center: float,
+    width: float,
+    sigma: float,
+) -> np.ndarray:
     """
-    Fit profile to:
-
-        I(x) = a0 + a1*(x-xmean)
-             + b*sin(2*pi*x/P)
-             + c*cos(2*pi*x/P)
-
-    The normalized fundamental modulation is:
-
-        sqrt(b^2 + c^2) / a0
+    Ideal rectangular bar convolved with a Gaussian line-spread function.
     """
-    x = np.arange(len(profile), dtype=float)
-    y = profile.astype(float)
-    xmean = np.mean(x)
+    x = np.asarray(x, dtype=float)
+    width = float(width)
+    sigma = max(float(sigma), 0.1)
+    denom = np.sqrt(2.0) * sigma
 
-    def model(x_values, a0, a1, b, c):
-        return (
-            a0
-            + a1 * (x_values - xmean)
-            + b * np.sin(2 * np.pi * x_values / period_px)
-            + c * np.cos(2 * np.pi * x_values / period_px)
-        )
-
-    p0 = [np.mean(y), 0.0, np.std(y), np.std(y)]
-
-    popt, _pcov = curve_fit(
-        model,
-        x,
-        y,
-        p0=p0,
-        maxfev=10000,
+    return 0.5 * (
+        erf((x - center + 0.5 * width) / denom)
+        - erf((x - center - 0.5 * width) / denom)
     )
 
-    a0, _a1, b, c = popt
-    baseline = a0
-    amplitude = np.sqrt(b ** 2 + c ** 2)
 
-    modulation = amplitude / baseline if baseline != 0 else np.nan
+def three_bar_convolution_model(
+    x: np.ndarray,
+    b0: float,
+    b1: float,
+    A: float,
+    x0: float,
+    w: float,
+    sigma: float,
+) -> np.ndarray:
+    """
+    Three ideal USAF bars convolved with a Gaussian LSF.
 
-    yfit = model(x, *popt)
+    The fitted sigma is converted to a Rayleigh-equivalent resolution using the
+    configured RMS-matching factor.
+    """
+    x = np.asarray(x, dtype=float)
+    signal = np.zeros_like(x, dtype=float)
+
+    for j in (-1, 0, 1):
+        signal += blurred_bar_profile(x, x0 + 2.0 * j * w, w, sigma)
+
+    return b0 + b1 * x + A * signal
+
+
+def parameter_standard_errors(
+    jacobian: np.ndarray,
+    residuals: np.ndarray,
+) -> np.ndarray:
+    """
+    Approximate 1-sigma parameter uncertainties from the least-squares Jacobian.
+
+    The covariance estimate is scaled by the residual variance.
+    """
+    jacobian = np.asarray(jacobian, dtype=float)
+    residuals = np.asarray(residuals, dtype=float)
+    n_obs, n_params = jacobian.shape
+    dof = n_obs - n_params
+    if dof <= 0:
+        return np.full(n_params, np.nan)
+
+    residual_variance = float(np.sum(residuals ** 2) / dof)
+    covariance = np.linalg.pinv(jacobian.T @ jacobian) * residual_variance
+    diagonal = np.diag(covariance)
+    return np.sqrt(np.maximum(diagonal, 0.0))
+
+
+def format_value_with_uncertainty(value: float, uncertainty: float) -> str:
+    """Format value and 1-sigma uncertainty compactly, for example 0.78(4)."""
+    if not np.isfinite(value):
+        return "nan"
+    if not np.isfinite(uncertainty) or uncertainty <= 0:
+        return f"{value:.4g}"
+
+    decimal_places = max(0, -int(np.floor(np.log10(uncertainty))))
+    if decimal_places > 6:
+        return f"{value:.4g}({uncertainty:.1g})"
+
+    uncertainty_digits = int(round(uncertainty * 10**decimal_places))
+    if uncertainty_digits >= 10:
+        decimal_places = max(0, decimal_places - 1)
+        uncertainty_digits = int(round(uncertainty * 10**decimal_places))
+
+    value_text = f"{value:.{decimal_places}f}"
+    return f"{value_text}({uncertainty_digits})"
+
+
+def three_bar_ideal_profile(
+    x: np.ndarray,
+    x0: float,
+    w: float,
+) -> np.ndarray:
+    """Unblurred ideal three-bar object profile used for diagnostics."""
+    x = np.asarray(x, dtype=float)
+    signal = np.zeros_like(x, dtype=float)
+
+    for j in (-1, 0, 1):
+        center = x0 + 2.0 * j * w
+        signal += (np.abs(x - center) < 0.5 * w).astype(float)
+
+    return signal
+
+
+def airy_kernel_1d(
+    offsets: np.ndarray,
+    r0: float,
+) -> np.ndarray:
+    """
+    Normalized 1D Airy kernel with first zero at |x| = r0.
+
+        A(x; r0) = [2*J1(3.83170597*|x|/r0) / (3.83170597*|x|/r0)]^2
+    """
+    offsets = np.asarray(offsets, dtype=float)
+    if not np.isfinite(r0) or r0 <= 0:
+        raise ValueError("r0 must be positive")
+
+    z = 3.83170597 * np.abs(offsets) / float(r0)
+    kernel = np.ones_like(z, dtype=float)
+    nonzero = z > np.finfo(float).eps
+    kernel[nonzero] = (2.0 * j1(z[nonzero]) / z[nonzero]) ** 2
+
+    normalization = float(np.sum(kernel))
+    if normalization <= np.finfo(float).eps:
+        raise ValueError("Airy kernel normalization is zero")
+
+    return kernel / normalization
+
+
+def three_bar_airy_convolution_model(
+    x: np.ndarray,
+    b0: float,
+    b1: float,
+    A: float,
+    x0: float,
+    w: float,
+    r0: float,
+) -> np.ndarray:
+    """
+    Three ideal USAF bars convolved with a normalized 1D Airy kernel.
+
+    Evaluate the convolution on a finer internal grid, then sample it at the
+    measured positions. This keeps x0 and w effectively continuous during the
+    fit instead of snapping bar edges to the measured pixel centers.
+    """
+    x = np.asarray(x, dtype=float)
+    if len(x) < 2:
+        raise ValueError("Airy convolution model requires at least two x samples")
+
+    dx = float(np.mean(np.diff(x)))
+    if not np.isfinite(dx) or dx <= 0:
+        raise ValueError("x must be increasing for Airy convolution model")
+
+    oversample = 8
+    fine_dx = dx / oversample
+    kernel_half_width = max(12.0 * float(r0), 4.0 * dx)
+    padding = kernel_half_width + dx
+    fine_x = np.arange(
+        x[0] - padding,
+        x[-1] + padding + 0.5 * fine_dx,
+        fine_dx,
+        dtype=float,
+    )
+
+    # Average each ideal rectangle over the fine-grid cell. The fractional
+    # edge cells make the numerical Airy model responsive to subpixel shifts.
+    ideal = np.zeros_like(fine_x, dtype=float)
+    cell_left = fine_x - 0.5 * fine_dx
+    cell_right = fine_x + 0.5 * fine_dx
+    for j in (-1, 0, 1):
+        center = x0 + 2.0 * j * w
+        bar_left = center - 0.5 * w
+        bar_right = center + 0.5 * w
+        ideal += np.maximum(
+            0.0,
+            np.minimum(cell_right, bar_right) - np.maximum(cell_left, bar_left),
+        ) / fine_dx
+
+    kernel_radius = int(np.ceil(kernel_half_width / fine_dx))
+    offsets = np.arange(-kernel_radius, kernel_radius + 1, dtype=float) * fine_dx
+    kernel = airy_kernel_1d(offsets, r0)
+    blurred = fftconvolve(ideal, kernel, mode="same")
+
+    return b0 + b1 * x + A * np.interp(x, fine_x, blurred)
+
+
+def _empty_convolution_result(message: str = "disabled") -> Dict[str, object]:
+    return {
+        "conv_fit_success": False,
+        "conv_sigma_px": np.nan,
+        "conv_sigma_um": np.nan,
+        "conv_sigma_mm": np.nan,
+        "conv_sigma_uncertainty_px": np.nan,
+        "conv_sigma_uncertainty_um": np.nan,
+        "conv_sigma_uncertainty_mm": np.nan,
+        "conv_rayleigh_equivalent_resolution_px": np.nan,
+        "conv_rayleigh_equivalent_resolution_um": np.nan,
+        "conv_rayleigh_equivalent_resolution_mm": np.nan,
+        "conv_rayleigh_equivalent_resolution_uncertainty_px": np.nan,
+        "conv_rayleigh_equivalent_resolution_uncertainty_um": np.nan,
+        "conv_rayleigh_equivalent_resolution_uncertainty_mm": np.nan,
+        "conv_object_pixel_um": np.nan,
+        "conv_object_pixel_mm": np.nan,
+        "conv_frequency_scale_source": "none",
+        "conv_w_px": np.nan,
+        "conv_w_um": np.nan,
+        "conv_w_mm": np.nan,
+        "conv_width_fixed": False,
+        "conv_stripe_spacing_um": np.nan,
+        "conv_width_bound_lower_px": np.nan,
+        "conv_width_bound_upper_px": np.nan,
+        "conv_width_bound_lower_um": np.nan,
+        "conv_width_bound_upper_um": np.nan,
+        "conv_width_bound_lower_mm": np.nan,
+        "conv_width_bound_upper_mm": np.nan,
+        "conv_x0_px": np.nan,
+        "conv_x0_um": np.nan,
+        "conv_x0_mm": np.nan,
+        "conv_amplitude": np.nan,
+        "conv_background_offset": np.nan,
+        "conv_background_slope": np.nan,
+        "conv_background_slope_per_px": np.nan,
+        "conv_background_slope_per_um": np.nan,
+        "conv_background_slope_per_mm": np.nan,
+        "conv_fit_rmse": np.nan,
+        "conv_fit_chi_squared": np.nan,
+        "conv_fit_r2": np.nan,
+        "conv_fit_message": message,
+        "conv_fit_profile": None,
+        "conv_ideal_profile": None,
+    }
+
+
+def _estimate_three_bar_initial_guess(
+    x: np.ndarray,
+    y: np.ndarray,
+    initial_width: Optional[float] = None,
+) -> Dict[str, float]:
+    """Estimate robust starting values for the three-bar convolution fit."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+
+    if n < 6:
+        raise ValueError("profile too short for three-bar convolution fit")
+
+    finite = np.isfinite(y)
+    if not np.any(finite):
+        raise ValueError("profile contains no finite values")
+
+    y_finite = y[finite]
+    y_med = float(np.nanmedian(y_finite))
+    y_min = float(np.nanmin(y_finite))
+    y_max = float(np.nanmax(y_finite))
+    y_ptp = max(y_max - y_min, np.finfo(float).eps)
+
+    if initial_width is not None and np.isfinite(initial_width) and initial_width > 0:
+        w0 = float(initial_width)
+    else:
+        period_guess = estimate_period_fft(y)
+        if np.isfinite(period_guess) and period_guess > 1:
+            w0 = 0.5 * float(period_guess)
+        else:
+            w0 = max(1.0, (float(np.nanmax(x)) - float(np.nanmin(x)) + 1.0) / 6.0)
+
+    w0 = float(np.clip(w0, 0.75, max(1.0, n)))
+
+    smooth_sigma = max(0.75, min(2.0, 0.15 * w0))
+    y_smooth = gaussian_filter1d(y.astype(float), sigma=smooth_sigma)
+
+    bright_contrast = float(np.nanmax(y_smooth) - np.nanmedian(y_smooth))
+    dark_contrast = float(np.nanmedian(y_smooth) - np.nanmin(y_smooth))
+    polarity_sign = 1.0 if bright_contrast >= dark_contrast else -1.0
+    feature_signal = polarity_sign * (y_smooth - np.nanmedian(y_smooth))
+
+    min_distance = max(1, int(round(1.2 * w0)))
+    peaks, props = find_peaks(
+        feature_signal,
+        distance=min_distance,
+        prominence=max(0.05 * y_ptp, np.finfo(float).eps),
+    )
+
+    x0 = 0.5 * (float(np.nanmin(x)) + float(np.nanmax(x)))
+    if len(peaks) >= 3:
+        prominences = props.get("prominences", np.ones(len(peaks)))
+        selected = peaks[np.argsort(prominences)[-3:]]
+        selected = np.sort(selected)
+        centers = x[selected]
+        x0 = float(np.median(centers))
+
+        spacings = np.diff(centers)
+        if initial_width is None and len(spacings) > 0:
+            spacing_guess = float(np.nanmedian(spacings))
+            if np.isfinite(spacing_guess) and spacing_guess > 1:
+                w0 = 0.5 * spacing_guess
+
+    elif len(peaks) > 0:
+        strongest = peaks[int(np.argmax(feature_signal[peaks]))]
+        x0 = float(x[strongest])
+
+    slope = 0.0
+    if n > 2:
+        try:
+            slope = float(np.polyfit(x[finite], y[finite], deg=1)[0])
+        except Exception:
+            slope = 0.0
+
+    amplitude = polarity_sign * y_ptp
 
     return {
-        "period_px": period_px,
-        "sine_baseline": baseline,
-        "sine_amplitude": amplitude,
-        "fundamental_modulation": abs(modulation),
-        "fit_profile": yfit,
-        "fit_parameters": popt,
+        "b0": y_med,
+        "b1": slope,
+        "A": amplitude,
+        "x0": x0,
+        "w": w0,
+        "sigma": max(0.5, 0.15 * w0),
     }
+
+
+def fit_three_bar_convolution(
+    profile: np.ndarray,
+    x: Optional[np.ndarray] = None,
+    initial_width: Optional[float] = None,
+    fixed_width: Optional[float] = None,
+    bounds: Optional[Dict[str, Tuple[float, float]]] = None,
+) -> Dict[str, object]:
+    """
+    Fit a finite three-bar object convolved with a Gaussian LSF.
+
+    The amplitude is allowed to be positive or negative, so the same model works
+    for bright bars on dark background and dark bars on bright background.
+    """
+    y = np.asarray(profile, dtype=float)
+    if x is None:
+        x = np.arange(len(y), dtype=float)
+    else:
+        x = np.asarray(x, dtype=float)
+
+    if len(x) != len(y):
+        raise ValueError("x and profile must have the same length")
+    if len(y) < 6:
+        raise ValueError("profile too short for three-bar convolution fit")
+
+    finite = np.isfinite(x) & np.isfinite(y)
+    if finite.sum() < 6:
+        raise ValueError("not enough finite profile samples")
+
+    x_fit = x[finite]
+    y_fit_data = y[finite]
+    guess = _estimate_three_bar_initial_guess(x_fit, y_fit_data, initial_width)
+
+    y_min = float(np.nanmin(y_fit_data))
+    y_max = float(np.nanmax(y_fit_data))
+    y_ptp = max(y_max - y_min, np.finfo(float).eps)
+
+    x_min = float(np.nanmin(x_fit))
+    x_max = float(np.nanmax(x_fit))
+    x_span = max(x_max - x_min, 1.0)
+
+    if fixed_width is not None and np.isfinite(fixed_width) and fixed_width > 0:
+        fit_w = float(fixed_width)
+    else:
+        fit_w = None
+
+    w0 = fit_w if fit_w is not None else guess["w"]
+    w_lower = max(0.5, 0.5 * w0)
+    w_upper = min(max(w_lower * 1.01, 1.5 * w0), max(x_span, w_lower * 1.01))
+    sigma_upper = max(1.0, min(2.0 * x_span, 4.0 * max(w0, 1.0)))
+
+    default_bounds = {
+        "b0": (y_min - 3.0 * y_ptp, y_max + 3.0 * y_ptp),
+        "b1": (-10.0 * y_ptp / x_span, 10.0 * y_ptp / x_span),
+        "A": (-5.0 * y_ptp, 5.0 * y_ptp),
+        "x0": (x_min, x_max),
+        "w": (w_lower, w_upper),
+        "sigma": (0.1, sigma_upper),
+    }
+    if bounds is not None:
+        default_bounds.update(bounds)
+
+    if fit_w is None:
+        p0 = np.array([
+            guess["b0"],
+            guess["b1"],
+            guess["A"],
+            guess["x0"],
+            np.clip(guess["w"], *default_bounds["w"]),
+            np.clip(guess["sigma"], *default_bounds["sigma"]),
+        ])
+        lower = np.array([default_bounds[k][0] for k in ("b0", "b1", "A", "x0", "w", "sigma")])
+        upper = np.array([default_bounds[k][1] for k in ("b0", "b1", "A", "x0", "w", "sigma")])
+
+        def residuals(params):
+            return three_bar_convolution_model(x_fit, *params) - y_fit_data
+
+    else:
+        p0 = np.array([
+            guess["b0"],
+            guess["b1"],
+            guess["A"],
+            guess["x0"],
+            np.clip(guess["sigma"], *default_bounds["sigma"]),
+        ])
+        lower = np.array([default_bounds[k][0] for k in ("b0", "b1", "A", "x0", "sigma")])
+        upper = np.array([default_bounds[k][1] for k in ("b0", "b1", "A", "x0", "sigma")])
+
+        def residuals(params):
+            b0, b1, A, x0, sigma = params
+            return three_bar_convolution_model(x_fit, b0, b1, A, x0, fit_w, sigma) - y_fit_data
+
+    p0 = np.clip(p0, lower, upper)
+    opt = least_squares(
+        residuals,
+        p0,
+        bounds=(lower, upper),
+        loss="linear",
+        max_nfev=20000,
+    )
+
+    if fit_w is None:
+        b0, b1, A, x0, w, sigma = opt.x
+    else:
+        b0, b1, A, x0, sigma = opt.x
+        w = fit_w
+
+    if not opt.success:
+        raise RuntimeError(opt.message)
+    if w <= 0 or sigma <= 0 or x0 < x_min or x0 > x_max:
+        raise RuntimeError("fit returned unphysical parameters")
+
+    y_model = three_bar_convolution_model(x, b0, b1, A, x0, w, sigma)
+    ideal = b0 + b1 * x + A * three_bar_ideal_profile(x, x0, w)
+
+    residual = y - y_model
+    residual_finite = residual[np.isfinite(residual)]
+    rmse = float(np.sqrt(np.mean(residual_finite ** 2))) if residual_finite.size else np.nan
+
+    y_centered = y_fit_data - np.mean(y_fit_data)
+    sst = float(np.sum(y_centered ** 2))
+    sse = float(np.sum((y_fit_data - three_bar_convolution_model(x_fit, b0, b1, A, x0, w, sigma)) ** 2))
+    r2 = np.nan if sst <= np.finfo(float).eps else float(1.0 - sse / sst)
+    parameter_errors = parameter_standard_errors(opt.jac, residuals(opt.x))
+    sigma_error = float(parameter_errors[-1])
+
+    return {
+        "success": True,
+        "message": opt.message,
+        "b0": float(b0),
+        "b1": float(b1),
+        "A": float(A),
+        "x0": float(x0),
+        "w": float(w),
+        "sigma": float(sigma),
+        "sigma_error": sigma_error,
+        "fit_profile": y_model,
+        "ideal_profile": ideal,
+        "rmse": rmse,
+        "chi_squared": sse,
+        "r2": r2,
+        "nfev": opt.nfev,
+        "fixed_width": fit_w is not None,
+    }
+
+
+def fit_three_bar_airy_convolution(
+    profile: np.ndarray,
+    x: Optional[np.ndarray] = None,
+    initial_width: Optional[float] = None,
+    fixed_width: Optional[float] = None,
+    bounds: Optional[Dict[str, Tuple[float, float]]] = None,
+) -> Dict[str, object]:
+    """Fit the finite three-bar object convolved with a normalized 1D Airy PSF."""
+    y = np.asarray(profile, dtype=float)
+    if x is None:
+        x = np.arange(len(y), dtype=float)
+    else:
+        x = np.asarray(x, dtype=float)
+
+    if len(x) != len(y):
+        raise ValueError("x and profile must have the same length")
+    if len(y) < 6:
+        raise ValueError("profile too short for three-bar Airy fit")
+
+    finite = np.isfinite(x) & np.isfinite(y)
+    if finite.sum() < 6:
+        raise ValueError("not enough finite profile samples")
+
+    x_fit = x[finite]
+    y_fit_data = y[finite]
+    guess = _estimate_three_bar_initial_guess(x_fit, y_fit_data, initial_width)
+
+    y_min = float(np.nanmin(y_fit_data))
+    y_max = float(np.nanmax(y_fit_data))
+    y_ptp = max(y_max - y_min, np.finfo(float).eps)
+    x_min = float(np.nanmin(x_fit))
+    x_max = float(np.nanmax(x_fit))
+    x_span = max(x_max - x_min, 1.0)
+
+    if fixed_width is not None and np.isfinite(fixed_width) and fixed_width > 0:
+        fit_w = float(fixed_width)
+    else:
+        fit_w = None
+
+    w0 = fit_w if fit_w is not None else guess["w"]
+    w_lower = max(0.5, 0.5 * w0)
+    w_upper = min(max(w_lower * 1.01, 1.5 * w0), max(x_span, w_lower * 1.01))
+    r0_upper = max(1.0, min(2.0 * x_span, 6.0 * max(w0, 1.0)))
+
+    default_bounds = {
+        "b0": (y_min - 3.0 * y_ptp, y_max + 3.0 * y_ptp),
+        "b1": (-10.0 * y_ptp / x_span, 10.0 * y_ptp / x_span),
+        "A": (-5.0 * y_ptp, 5.0 * y_ptp),
+        "x0": (x_min, x_max),
+        "w": (w_lower, w_upper),
+        "r0": (0.1, r0_upper),
+    }
+    if bounds is not None:
+        default_bounds.update(bounds)
+
+    r00 = max(0.5, 0.75 * w0)
+    if fit_w is None:
+        p0 = np.array([
+            guess["b0"],
+            guess["b1"],
+            guess["A"],
+            guess["x0"],
+            np.clip(guess["w"], *default_bounds["w"]),
+            np.clip(r00, *default_bounds["r0"]),
+        ])
+        keys = ("b0", "b1", "A", "x0", "w", "r0")
+        lower = np.array([default_bounds[k][0] for k in keys])
+        upper = np.array([default_bounds[k][1] for k in keys])
+
+        def residuals(params):
+            return three_bar_airy_convolution_model(x_fit, *params) - y_fit_data
+
+    else:
+        p0 = np.array([
+            guess["b0"],
+            guess["b1"],
+            guess["A"],
+            guess["x0"],
+            np.clip(r00, *default_bounds["r0"]),
+        ])
+        keys = ("b0", "b1", "A", "x0", "r0")
+        lower = np.array([default_bounds[k][0] for k in keys])
+        upper = np.array([default_bounds[k][1] for k in keys])
+
+        def residuals(params):
+            b0, b1, A, x0, r0 = params
+            return (
+                three_bar_airy_convolution_model(x_fit, b0, b1, A, x0, fit_w, r0)
+                - y_fit_data
+            )
+
+    p0 = np.clip(p0, lower, upper)
+    r0_guesses = np.clip(
+        np.asarray([0.25, 0.5, 0.75, 1.0, 1.5]) * w0,
+        *default_bounds["r0"],
+    )
+    r0_guesses = np.unique(np.append(r0_guesses, p0[-1]))
+    opt = None
+    best_sse = np.inf
+    for r0_guess in r0_guesses:
+        trial_p0 = p0.copy()
+        trial_p0[-1] = r0_guess
+        trial_opt = least_squares(
+            residuals,
+            trial_p0,
+            bounds=(lower, upper),
+            loss="linear",
+            max_nfev=20000,
+        )
+        trial_sse = float(np.sum(residuals(trial_opt.x) ** 2))
+        if opt is None or trial_sse < best_sse:
+            opt = trial_opt
+            best_sse = trial_sse
+
+    if fit_w is None:
+        b0, b1, A, x0, w, r0 = opt.x
+    else:
+        b0, b1, A, x0, r0 = opt.x
+        w = fit_w
+
+    if not opt.success:
+        raise RuntimeError(opt.message)
+    if w <= 0 or r0 <= 0 or x0 < x_min or x0 > x_max:
+        raise RuntimeError("Airy fit returned unphysical parameters")
+
+    y_model = three_bar_airy_convolution_model(x, b0, b1, A, x0, w, r0)
+    ideal = b0 + b1 * x + A * three_bar_ideal_profile(x, x0, w)
+    residual = y - y_model
+    residual_finite = residual[np.isfinite(residual)]
+    rmse = float(np.sqrt(np.mean(residual_finite ** 2))) if residual_finite.size else np.nan
+
+    y_centered = y_fit_data - np.mean(y_fit_data)
+    sst = float(np.sum(y_centered ** 2))
+    sse = float(
+        np.sum(
+            (
+                y_fit_data
+                - three_bar_airy_convolution_model(x_fit, b0, b1, A, x0, w, r0)
+            )
+            ** 2
+        )
+    )
+    r2 = np.nan if sst <= np.finfo(float).eps else float(1.0 - sse / sst)
+
+    return {
+        "success": True,
+        "message": opt.message,
+        "b0": float(b0),
+        "b1": float(b1),
+        "A": float(A),
+        "x0": float(x0),
+        "w": float(w),
+        "r0": float(r0),
+        "fit_profile": y_model,
+        "ideal_profile": ideal,
+        "rmse": rmse,
+        "chi_squared": sse,
+        "r2": r2,
+        "nfev": opt.nfev,
+        "fixed_width": fit_w is not None,
+    }
+
+
+def _empty_airy_result(message: str = "disabled") -> Dict[str, object]:
+    return {
+        "airy_fit_success": False,
+        "airy_r0_px": np.nan,
+        "airy_r0_um": np.nan,
+        "airy_r0_mm": np.nan,
+        "airy_rayleigh_resolution_um": np.nan,
+        "airy_object_pixel_um": np.nan,
+        "airy_frequency_scale_source": "none",
+        "airy_w_px": np.nan,
+        "airy_w_um": np.nan,
+        "airy_width_fixed": False,
+        "airy_x0_px": np.nan,
+        "airy_x0_um": np.nan,
+        "airy_amplitude": np.nan,
+        "airy_background_offset": np.nan,
+        "airy_background_slope_per_px": np.nan,
+        "airy_background_slope_per_um": np.nan,
+        "airy_fit_rmse": np.nan,
+        "airy_fit_chi_squared": np.nan,
+        "airy_fit_r2": np.nan,
+        "airy_fit_message": message,
+        "airy_fit_profile": None,
+        "airy_ideal_profile": None,
+    }
+
+
+def fit_airy_psf_profile(
+    profile: np.ndarray,
+    x: Optional[np.ndarray] = None,
+    initial_width: Optional[float] = None,
+    fixed_width: Optional[float] = None,
+    width_bounds: Optional[Tuple[float, float]] = None,
+    pixel_size_um: Optional[float] = None,
+    nominal_lpmm: Optional[float] = None,
+) -> Dict[str, object]:
+    """Fit the 1D Airy PSF model and report its first-zero radius."""
+    result = _empty_airy_result("not run")
+    fit_bounds = None
+    if width_bounds is not None:
+        lo, hi = width_bounds
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo > 0:
+            fit_bounds = {"w": (float(lo), float(hi))}
+
+    try:
+        fit = fit_three_bar_airy_convolution(
+            profile,
+            x=x,
+            initial_width=initial_width,
+            fixed_width=fixed_width,
+            bounds=fit_bounds,
+        )
+
+        w_px = fit["w"]
+        f0_cyc_per_px = 1.0 / (2.0 * w_px) if w_px > 0 else np.nan
+        object_pixel_um = np.nan
+        frequency_scale_source = "pixel"
+        if pixel_size_um is not None and np.isfinite(pixel_size_um) and pixel_size_um > 0:
+            object_pixel_um = float(pixel_size_um)
+            frequency_scale_source = "calibration"
+        elif nominal_lpmm is not None and np.isfinite(nominal_lpmm) and nominal_lpmm > 0:
+            object_pixel_um = f0_cyc_per_px * 1000.0 / nominal_lpmm
+            frequency_scale_source = "group_element"
+
+        r0_um = np.nan
+        r0_mm = np.nan
+        w_um = np.nan
+        x0_um = np.nan
+        slope_per_um = np.nan
+        if np.isfinite(object_pixel_um) and object_pixel_um > 0:
+            r0_um = fit["r0"] * object_pixel_um
+            r0_mm = r0_um / 1000.0
+            w_um = w_px * object_pixel_um
+            x0_um = fit["x0"] * object_pixel_um
+            slope_per_um = fit["b1"] / object_pixel_um
+
+        result.update({
+            "airy_fit_success": True,
+            "airy_r0_px": fit["r0"],
+            "airy_r0_um": r0_um,
+            "airy_r0_mm": r0_mm,
+            "airy_rayleigh_resolution_um": r0_um,
+            "airy_object_pixel_um": object_pixel_um,
+            "airy_frequency_scale_source": frequency_scale_source,
+            "airy_w_px": w_px,
+            "airy_w_um": w_um,
+            "airy_width_fixed": fit["fixed_width"],
+            "airy_x0_px": fit["x0"],
+            "airy_x0_um": x0_um,
+            "airy_amplitude": fit["A"],
+            "airy_background_offset": fit["b0"],
+            "airy_background_slope_per_px": fit["b1"],
+            "airy_background_slope_per_um": slope_per_um,
+            "airy_fit_rmse": fit["rmse"],
+            "airy_fit_chi_squared": fit["chi_squared"],
+            "airy_fit_r2": fit["r2"],
+            "airy_fit_message": fit["message"],
+            "airy_fit_profile": fit["fit_profile"],
+            "airy_ideal_profile": fit["ideal_profile"],
+        })
+
+    except Exception as exc:
+        result["airy_fit_message"] = str(exc)
+
+    return result
+
+
+def fit_gaussian_psf_profile(
+    profile: np.ndarray,
+    x: Optional[np.ndarray] = None,
+    initial_width: Optional[float] = None,
+    fixed_width: Optional[float] = None,
+    width_bounds: Optional[Tuple[float, float]] = None,
+    pixel_size_um: Optional[float] = None,
+    nominal_lpmm: Optional[float] = None,
+) -> Dict[str, object]:
+    """
+    Fit the ideal three-bar object convolved with a Gaussian LSF.
+
+    Report the fitted Gaussian sigma and the RMS-matched Rayleigh-equivalent
+    resolution. This is a real-space PSF-model fit, not a sampled MTF estimate.
+    """
+    result = _empty_convolution_result("not run")
+
+    fit_bounds = None
+    if width_bounds is not None:
+        lo, hi = width_bounds
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo > 0:
+            fit_bounds = {"w": (float(lo), float(hi))}
+            result["conv_width_bound_lower_px"] = float(lo)
+            result["conv_width_bound_upper_px"] = float(hi)
+
+    try:
+        fit = fit_three_bar_convolution(
+            profile,
+            x=x,
+            initial_width=initial_width,
+            fixed_width=fixed_width,
+            bounds=fit_bounds,
+        )
+
+        sigma_px = fit["sigma"]
+        sigma_uncertainty_px = fit["sigma_error"]
+        w_px = fit["w"]
+        freq_cyc_per_px = 1.0 / (2.0 * w_px) if w_px > 0 else np.nan
+
+        object_pixel_um = np.nan
+        frequency_scale_source = "pixel"
+        if pixel_size_um is not None and np.isfinite(pixel_size_um) and pixel_size_um > 0:
+            object_pixel_um = float(pixel_size_um)
+            frequency_scale_source = "calibration"
+        elif (
+            nominal_lpmm is not None
+            and np.isfinite(nominal_lpmm)
+            and nominal_lpmm > 0
+            and np.isfinite(freq_cyc_per_px)
+            and freq_cyc_per_px > 0
+        ):
+            object_pixel_um = freq_cyc_per_px * 1000.0 / nominal_lpmm
+            frequency_scale_source = "group_element"
+
+        sigma_um = np.nan
+        sigma_mm = np.nan
+        sigma_uncertainty_um = np.nan
+        sigma_uncertainty_mm = np.nan
+        # RMS-matched Airy/Rayleigh-equivalent resolution for a Gaussian PSF.
+        rayleigh_equivalent_resolution_px = (
+            GAUSSIAN_RAYLEIGH_EQUIVALENT_FACTOR * sigma_px
+        )
+        rayleigh_equivalent_resolution_um = np.nan
+        rayleigh_equivalent_resolution_mm = np.nan
+        rayleigh_equivalent_resolution_uncertainty_px = (
+            GAUSSIAN_RAYLEIGH_EQUIVALENT_FACTOR * sigma_uncertainty_px
+        )
+        rayleigh_equivalent_resolution_uncertainty_um = np.nan
+        rayleigh_equivalent_resolution_uncertainty_mm = np.nan
+        object_pixel_mm = np.nan
+        w_um = np.nan
+        w_mm = np.nan
+        stripe_spacing_um = np.nan
+        width_bound_lower_um = np.nan
+        width_bound_upper_um = np.nan
+        width_bound_lower_mm = np.nan
+        width_bound_upper_mm = np.nan
+        x0_um = np.nan
+        x0_mm = np.nan
+        background_slope_per_um = np.nan
+        background_slope_per_mm = np.nan
+        if np.isfinite(object_pixel_um) and object_pixel_um > 0:
+            sigma_um = sigma_px * object_pixel_um
+            sigma_mm = sigma_um / 1000.0
+            sigma_uncertainty_um = sigma_uncertainty_px * object_pixel_um
+            sigma_uncertainty_mm = sigma_uncertainty_um / 1000.0
+            rayleigh_equivalent_resolution_um = (
+                rayleigh_equivalent_resolution_px * object_pixel_um
+            )
+            rayleigh_equivalent_resolution_mm = (
+                rayleigh_equivalent_resolution_um / 1000.0
+            )
+            rayleigh_equivalent_resolution_uncertainty_um = (
+                rayleigh_equivalent_resolution_uncertainty_px * object_pixel_um
+            )
+            rayleigh_equivalent_resolution_uncertainty_mm = (
+                rayleigh_equivalent_resolution_uncertainty_um / 1000.0
+            )
+            object_pixel_mm = object_pixel_um / 1000.0
+            w_um = w_px * object_pixel_um
+            w_mm = w_px * object_pixel_mm
+            stripe_spacing_um = 2.0 * w_um
+            x0_um = fit["x0"] * object_pixel_um
+            x0_mm = fit["x0"] * object_pixel_mm
+            background_slope_per_um = fit["b1"] / object_pixel_um
+            background_slope_per_mm = fit["b1"] / object_pixel_mm
+            if np.isfinite(result["conv_width_bound_lower_px"]):
+                width_bound_lower_um = (
+                    result["conv_width_bound_lower_px"] * object_pixel_um
+                )
+                width_bound_lower_mm = (
+                    result["conv_width_bound_lower_px"] * object_pixel_mm
+                )
+            if np.isfinite(result["conv_width_bound_upper_px"]):
+                width_bound_upper_um = (
+                    result["conv_width_bound_upper_px"] * object_pixel_um
+                )
+                width_bound_upper_mm = (
+                    result["conv_width_bound_upper_px"] * object_pixel_mm
+                )
+
+        result.update({
+            "conv_fit_success": True,
+            "conv_sigma_px": sigma_px,
+            "conv_sigma_um": sigma_um,
+            "conv_sigma_mm": sigma_mm,
+            "conv_sigma_uncertainty_px": sigma_uncertainty_px,
+            "conv_sigma_uncertainty_um": sigma_uncertainty_um,
+            "conv_sigma_uncertainty_mm": sigma_uncertainty_mm,
+            "conv_rayleigh_equivalent_resolution_px": rayleigh_equivalent_resolution_px,
+            "conv_rayleigh_equivalent_resolution_um": rayleigh_equivalent_resolution_um,
+            "conv_rayleigh_equivalent_resolution_mm": rayleigh_equivalent_resolution_mm,
+            "conv_rayleigh_equivalent_resolution_uncertainty_px": rayleigh_equivalent_resolution_uncertainty_px,
+            "conv_rayleigh_equivalent_resolution_uncertainty_um": rayleigh_equivalent_resolution_uncertainty_um,
+            "conv_rayleigh_equivalent_resolution_uncertainty_mm": rayleigh_equivalent_resolution_uncertainty_mm,
+            "conv_object_pixel_um": object_pixel_um,
+            "conv_object_pixel_mm": object_pixel_mm,
+            "conv_frequency_scale_source": frequency_scale_source,
+            "conv_w_px": w_px,
+            "conv_w_um": w_um,
+            "conv_w_mm": w_mm,
+            "conv_width_fixed": fit["fixed_width"],
+            "conv_stripe_spacing_um": stripe_spacing_um,
+            "conv_width_bound_lower_px": result["conv_width_bound_lower_px"],
+            "conv_width_bound_upper_px": result["conv_width_bound_upper_px"],
+            "conv_width_bound_lower_um": width_bound_lower_um,
+            "conv_width_bound_upper_um": width_bound_upper_um,
+            "conv_width_bound_lower_mm": width_bound_lower_mm,
+            "conv_width_bound_upper_mm": width_bound_upper_mm,
+            "conv_x0_px": fit["x0"],
+            "conv_x0_um": x0_um,
+            "conv_x0_mm": x0_mm,
+            "conv_amplitude": fit["A"],
+            "conv_background_offset": fit["b0"],
+            "conv_background_slope": fit["b1"],
+            "conv_background_slope_per_px": fit["b1"],
+            "conv_background_slope_per_um": background_slope_per_um,
+            "conv_background_slope_per_mm": background_slope_per_mm,
+            "conv_fit_rmse": fit["rmse"],
+            "conv_fit_chi_squared": fit["chi_squared"],
+            "conv_fit_r2": fit["r2"],
+            "conv_fit_message": fit["message"],
+            "conv_fit_profile": fit["fit_profile"],
+            "conv_ideal_profile": fit["ideal_profile"],
+        })
+
+    except Exception as exc:
+        result["conv_fit_message"] = str(exc)
+
+    return result
+
+
+# Backward-compatible name for notebooks written before the PSF-fit cleanup.
+fit_convolution_mtf_profile = fit_gaussian_psf_profile
 
 
 def profile_periodic_score(
@@ -471,38 +1558,31 @@ def profile_periodic_score(
     """
     Score how stripe-like a 1D profile is.
 
-    If expected_period_px is available, use sine fitting at that expected period.
-    Otherwise, estimate the dominant period by FFT.
+    This lightweight score is used only for orientation detection. It measures
+    the normalized projection at the expected or FFT-estimated stripe period;
+    it is not reported as a resolution or MTF result.
     """
     profile_corr = remove_slow_background(profile, poly_order=1)
     profile_corr = gaussian_filter1d(profile_corr.astype(float), sigma=1.0)
-
-    contrast = michelson_contrast(profile_corr)
+    centered = profile_corr - np.mean(profile_corr)
+    rms = float(np.sqrt(np.mean(centered ** 2)))
 
     if expected_period_px is not None and np.isfinite(expected_period_px):
         period_px = expected_period_px
     else:
         period_px = estimate_period_fft(profile_corr)
 
-    modulation = np.nan
-    score = contrast
+    score = rms
 
     if period_px is not None and np.isfinite(period_px) and 2 < period_px < len(profile_corr):
-        try:
-            sine_result = fit_sine_fixed_period(profile_corr, period_px)
-            modulation = sine_result["fundamental_modulation"]
-
-            if np.isfinite(modulation):
-                score = modulation
-
-        except Exception:
-            pass
+        x = np.arange(len(centered), dtype=float)
+        projection = np.sum(centered * np.exp(-2j * np.pi * x / period_px))
+        amplitude = 2.0 * abs(projection) / len(centered)
+        score = float(amplitude / max(rms, np.finfo(float).eps))
 
     return {
         "score": score,
-        "contrast": contrast,
         "period_px": period_px,
-        "fundamental_modulation": modulation,
     }
 
 
@@ -575,8 +1655,13 @@ def analyze_stripe_roi(
     lpmm: Optional[float] = None,
     period_px: Optional[float] = None,
     calibration: Optional[CameraCalibration] = None,
-    target_contrast: float = 1.0,
     angle_deg: float = 0.0,
+    enable_convolution_mtf: bool = True,
+    convolution_initial_width_px: Optional[float] = None,
+    convolution_fixed_width_px: Optional[float] = None,
+    fix_convolution_width: bool = False,
+    psf_model: str = "gaussian",
+    auto_trim_profile_band: bool = True,
 ) -> pd.DataFrame:
     """
     Analyze one USAF stripe ROI.
@@ -590,6 +1675,10 @@ def analyze_stripe_roi(
 
     if calibration is None:
         calibration = CameraCalibration()
+    if psf_model not in ("gaussian", "airy", "both"):
+        raise ValueError("psf_model must be 'gaussian', 'airy', or 'both'")
+
+    input_period_px = period_px
 
     # Determine lp/mm from USAF group/element if needed.
     if lpmm is None and group is not None and element is not None:
@@ -597,11 +1686,21 @@ def analyze_stripe_roi(
 
     # Determine expected period in pixels if possible.
     expected_period_px = period_px
+    nominal_w_px = nominal_bar_width_px_from_lpmm(lpmm, calibration)
+    nominal_width_source = "none"
 
     if expected_period_px is None and lpmm is not None:
         obj_px_um = calibration.object_pixel_um
         if obj_px_um is not None:
             expected_period_px = (1000.0 / lpmm) / obj_px_um
+
+    if np.isfinite(nominal_w_px):
+        nominal_width_source = "group_element_or_lpmm_calibration"
+    elif input_period_px is not None and np.isfinite(input_period_px) and input_period_px > 0:
+        nominal_w_px = 0.5 * float(input_period_px)
+        nominal_width_source = "input_period_px"
+
+    nominal_width_bounds = width_bounds_around_nominal(nominal_w_px)
 
     # Auto-detect orientation if not provided.
     orientation_diag = None
@@ -616,11 +1715,21 @@ def analyze_stripe_roi(
         if orientation not in ["vertical", "horizontal"]:
             raise ValueError("orientation must be 'vertical', 'horizontal', or None")
 
-    raw_profile = extract_bar_profile(crop, orientation)
-    corrected_profile = remove_slow_background(raw_profile, poly_order=1)
+    band_diag = {
+        "band": (0, crop.shape[0] if orientation == "vertical" else crop.shape[1]),
+        "band_axis": "y" if orientation == "vertical" else "x",
+        "band_fraction": 1.0,
+        "trim_applied": False,
+    }
+    if auto_trim_profile_band:
+        band_diag = estimate_stripe_averaging_band(crop, orientation)
 
-    contrast = michelson_contrast(corrected_profile)
-    ctf = contrast / target_contrast if target_contrast != 0 else np.nan
+    raw_profile = extract_bar_profile(
+        crop,
+        orientation,
+        averaging_band=band_diag["band"],
+    )
+    corrected_profile = remove_slow_background(raw_profile, poly_order=1)
 
     if period_px is None:
         if expected_period_px is not None:
@@ -628,29 +1737,51 @@ def analyze_stripe_roi(
         else:
             period_px = estimate_period_fft(corrected_profile)
 
-    sine_result = {}
-
-    if period_px is not None and np.isfinite(period_px) and period_px > 1:
-        try:
-            sine_result = fit_sine_fixed_period(corrected_profile, period_px)
-            fundamental_modulation = sine_result["fundamental_modulation"]
-
-            target_fundamental_modulation = (4.0 / np.pi) * target_contrast
-
-            fundamental_mtf_estimate = (
-                fundamental_modulation / target_fundamental_modulation
-                if target_fundamental_modulation != 0
-                else np.nan
+    conv_result = _empty_convolution_result()
+    airy_result = _empty_airy_result()
+    if enable_convolution_mtf:
+        conv_initial_width_px = convolution_initial_width_px
+        if np.isfinite(nominal_w_px):
+            conv_initial_width_px = nominal_w_px
+        if conv_initial_width_px is None:
+            conv_initial_width_px = (
+                0.5 * period_px
+                if period_px is not None and np.isfinite(period_px) and period_px > 0
+                else None
             )
 
-        except Exception as exc:
-            print(f"Warning: sine fit failed: {exc}")
-            fundamental_modulation = np.nan
-            fundamental_mtf_estimate = np.nan
+        conv_fixed_width_px = convolution_fixed_width_px
+        if (
+            conv_fixed_width_px is None
+            and nominal_width_source == "group_element_or_lpmm_calibration"
+        ):
+            # When USAF geometry and calibration provide the nominal bar width,
+            # keep it fixed so the PSF width is not traded against target width.
+            conv_fixed_width_px = nominal_w_px
+        elif conv_fixed_width_px is None and fix_convolution_width:
+            conv_fixed_width_px = conv_initial_width_px
 
-    else:
-        fundamental_modulation = np.nan
-        fundamental_mtf_estimate = np.nan
+        if psf_model in ("gaussian", "both"):
+            conv_result = fit_gaussian_psf_profile(
+                raw_profile,
+                x=np.arange(len(raw_profile), dtype=float),
+                initial_width=conv_initial_width_px,
+                fixed_width=conv_fixed_width_px,
+                width_bounds=nominal_width_bounds if conv_fixed_width_px is None else None,
+                pixel_size_um=calibration.object_pixel_um,
+                nominal_lpmm=lpmm,
+            )
+
+        if psf_model in ("airy", "both"):
+            airy_result = fit_airy_psf_profile(
+                raw_profile,
+                x=np.arange(len(raw_profile), dtype=float),
+                initial_width=conv_initial_width_px,
+                fixed_width=conv_fixed_width_px,
+                width_bounds=nominal_width_bounds if conv_fixed_width_px is None else None,
+                pixel_size_um=calibration.object_pixel_um,
+                nominal_lpmm=lpmm,
+            )
 
     if lpmm is not None:
         res = resolution_from_lpmm(lpmm)
@@ -661,24 +1792,253 @@ def analyze_stripe_roi(
             "half_pitch_um": np.nan,
         }
 
-    x = np.arange(len(corrected_profile))
+    if auto_trim_profile_band and band_diag["trim_applied"]:
+        b0, b1 = band_diag["band"]
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.imshow(crop, cmap="gray", origin="upper")
+        if orientation == "vertical":
+            ax.axhspan(b0, b1, facecolor="tab:green", alpha=0.18)
+            ax.axhline(b0, color="tab:green", linewidth=0.8)
+            ax.axhline(b1, color="tab:green", linewidth=0.8)
+        else:
+            ax.axvspan(b0, b1, facecolor="tab:green", alpha=0.18)
+            ax.axvline(b0, color="tab:green", linewidth=0.8)
+            ax.axvline(b1, color="tab:green", linewidth=0.8)
+        ax.set_title("Stripe ROI averaging band")
+        fig.tight_layout()
+        fig.savefig(os.path.join(outdir, "stripe_profile_averaging_band.png"), dpi=200)
+        plt.close(fig)
 
-    plt.figure(figsize=(7, 4))
-    plt.plot(x, corrected_profile, label="corrected profile")
+    if enable_convolution_mtf:
+        x_raw = np.arange(len(raw_profile), dtype=float)
+        object_pixel_um = conv_result["conv_object_pixel_um"]
+        if not np.isfinite(object_pixel_um):
+            object_pixel_um = airy_result["airy_object_pixel_um"]
+        if not np.isfinite(object_pixel_um) and calibration.object_pixel_um is not None:
+            object_pixel_um = calibration.object_pixel_um
 
-    if "fit_profile" in sine_result:
-        plt.plot(x, sine_result["fit_profile"], "--", label="fundamental sine fit")
+        if np.isfinite(object_pixel_um) and object_pixel_um > 0:
+            x_conv_plot = x_raw * object_pixel_um
+            x_conv_label = "object-space position (um)"
+        else:
+            x_conv_plot = x_raw
+            x_conv_label = "position (pixel; no physical scale available)"
 
-    plt.xlabel("pixel")
-    plt.ylabel("intensity counts")
-    plt.title(
-        f"Stripe profile, orientation={orientation}\n"
-        f"CTF={ctf:.3f}, fundamental MTF estimate={fundamental_mtf_estimate:.3f}"
-    )
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, "stripe_profile_fit.png"), dpi=200)
-    plt.close()
+        fig, (ax_profile, ax_resid) = plt.subplots(
+            2,
+            1,
+            figsize=(7, 5),
+            sharex=True,
+            gridspec_kw={"height_ratios": [3, 1]},
+        )
+        ax_profile.plot(
+            x_conv_plot,
+            raw_profile,
+            linestyle="none",
+            marker="o",
+            markersize=4,
+            color="tab:blue",
+            label="measured profile",
+        )
+
+        gaussian_success = conv_result["conv_fit_success"]
+        airy_success = airy_result["airy_fit_success"]
+        if gaussian_success or airy_success:
+            x_theory_raw = np.linspace(x_raw[0], x_raw[-1], 1200)
+            if np.isfinite(object_pixel_um) and object_pixel_um > 0:
+                x_theory_plot = x_theory_raw * object_pixel_um
+            else:
+                x_theory_plot = x_theory_raw
+
+            if psf_model == "airy" and airy_success:
+                ideal_result = airy_result
+                ideal_prefix = "airy"
+            elif gaussian_success:
+                ideal_result = conv_result
+                ideal_prefix = "conv"
+            else:
+                ideal_result = airy_result
+                ideal_prefix = "airy"
+
+            ideal_profile_theory = (
+                ideal_result[f"{ideal_prefix}_background_offset"]
+                + ideal_result[f"{ideal_prefix}_background_slope_per_px"] * x_theory_raw
+                + ideal_result[f"{ideal_prefix}_amplitude"]
+                * three_bar_ideal_profile(
+                    x_theory_raw,
+                    ideal_result[f"{ideal_prefix}_x0_px"],
+                    ideal_result[f"{ideal_prefix}_w_px"],
+                )
+            )
+            title_lines = []
+            if psf_model == "both":
+                ax_profile.plot(
+                    x_theory_plot,
+                    ideal_profile_theory,
+                    ":",
+                    drawstyle="steps-mid",
+                    color="0.35",
+                    label="unblurred model",
+                )
+            else:
+                ax_profile.plot(
+                    x_theory_plot,
+                    ideal_profile_theory,
+                    "-",
+                    color="tab:green",
+                    label="unblurred model",
+                )
+
+            if gaussian_success and psf_model in ("gaussian", "both"):
+                gaussian_theory = three_bar_convolution_model(
+                    x_theory_raw,
+                    conv_result["conv_background_offset"],
+                    conv_result["conv_background_slope_per_px"],
+                    conv_result["conv_amplitude"],
+                    conv_result["conv_x0_px"],
+                    conv_result["conv_w_px"],
+                    conv_result["conv_sigma_px"],
+                )
+                ax_profile.plot(
+                    x_theory_plot,
+                    gaussian_theory,
+                    "-",
+                    color="tab:orange",
+                    label="Gaussian fit",
+                )
+                ax_resid.plot(
+                    x_conv_plot,
+                    raw_profile - conv_result["conv_fit_profile"],
+                    linestyle="none" if psf_model == "gaussian" else "-",
+                    marker="o" if psf_model == "gaussian" else None,
+                    markersize=4,
+                    color="tab:blue" if psf_model == "gaussian" else "tab:orange",
+                    label="residual" if psf_model == "gaussian" else "Gaussian residual",
+                )
+                if np.isfinite(conv_result["conv_sigma_um"]):
+                    sigma_text = format_value_with_uncertainty(
+                        conv_result["conv_sigma_um"],
+                        conv_result["conv_sigma_uncertainty_um"],
+                    )
+                    resolution_text = format_value_with_uncertainty(
+                        conv_result["conv_rayleigh_equivalent_resolution_um"],
+                        conv_result[
+                            "conv_rayleigh_equivalent_resolution_uncertainty_um"
+                        ],
+                    )
+                    title_lines.append(
+                        "Gaussian-model fit: "
+                        f"σ={sigma_text} um\n"
+                        "Rayleigh-equivalent resolution=2.898785σ="
+                        f"{resolution_text} um"
+                    )
+                else:
+                    sigma_text = format_value_with_uncertainty(
+                        conv_result["conv_sigma_px"],
+                        conv_result["conv_sigma_uncertainty_px"],
+                    )
+                    resolution_text = format_value_with_uncertainty(
+                        conv_result["conv_rayleigh_equivalent_resolution_px"],
+                        conv_result[
+                            "conv_rayleigh_equivalent_resolution_uncertainty_px"
+                        ],
+                    )
+                    title_lines.append(
+                        "Gaussian-model fit: "
+                        f"σ={sigma_text} px\n"
+                        "Rayleigh-equivalent resolution=2.898785σ="
+                        f"{resolution_text} px"
+                    )
+
+            if airy_success and psf_model in ("airy", "both"):
+                airy_theory = three_bar_airy_convolution_model(
+                    x_theory_raw,
+                    airy_result["airy_background_offset"],
+                    airy_result["airy_background_slope_per_px"],
+                    airy_result["airy_amplitude"],
+                    airy_result["airy_x0_px"],
+                    airy_result["airy_w_px"],
+                    airy_result["airy_r0_px"],
+                )
+                ax_profile.plot(
+                    x_theory_plot,
+                    airy_theory,
+                    "-",
+                    color="tab:orange" if psf_model == "airy" else "tab:green",
+                    label="Airy fit",
+                )
+                ax_resid.plot(
+                    x_conv_plot,
+                    raw_profile - airy_result["airy_fit_profile"],
+                    linestyle="none" if psf_model == "airy" else "-",
+                    marker="o" if psf_model == "airy" else None,
+                    markersize=4,
+                    color="tab:blue" if psf_model == "airy" else "tab:green",
+                    label="residual" if psf_model == "airy" else "Airy residual",
+                )
+                if np.isfinite(airy_result["airy_r0_um"]):
+                    title_lines.append(
+                        "Airy-model fit: "
+                        f"r0={airy_result['airy_r0_um']:.4g} um, "
+                        f"Rayleigh resolution={airy_result['airy_r0_um']:.4g} um"
+                    )
+                else:
+                    title_lines.append(
+                        "Airy-model fit: "
+                        f"r0 Rayleigh resolution={airy_result['airy_r0_px']:.4g} px"
+                    )
+
+            if group is not None and element is not None:
+                # A named USAF element has a standard line-pair period. Keep
+                # the measured pixel period in the CSV, but label the plot
+                # with the nominal target geometry.
+                spacing_um = 1000.0 / usaf_lpmm(group, element)
+                spacing_label = f"stripe spacing = {spacing_um:.4g} um"
+            else:
+                if period_px is not None and np.isfinite(period_px) and period_px > 0:
+                    spacing_px = float(period_px)
+                elif np.isfinite(nominal_w_px) and nominal_w_px > 0:
+                    spacing_px = 2.0 * float(nominal_w_px)
+                else:
+                    spacing_px = 2.0 * ideal_result[f"{ideal_prefix}_w_px"]
+                if np.isfinite(object_pixel_um) and object_pixel_um > 0:
+                    spacing_label = f"stripe spacing = {spacing_px * object_pixel_um:.4g} um"
+                else:
+                    spacing_label = f"stripe spacing = {spacing_px:.4g} px"
+            fig.text(
+                0.5,
+                0.01,
+                spacing_label,
+                ha="center",
+                va="bottom",
+                fontsize=9,
+            )
+            ax_profile.set_title("\n".join(title_lines))
+        else:
+            ax_profile.set_title(
+                f"Three-bar PSF fit failed ({psf_model}): "
+                f"Gaussian: {conv_result['conv_fit_message']}; "
+                f"Airy: {airy_result['airy_fit_message']}"
+            )
+            ax_resid.plot(
+                x_conv_plot,
+                np.zeros_like(x_raw),
+                linestyle="-",
+                label="residual",
+            )
+
+        ax_profile.set_ylabel("intensity counts")
+        ax_profile.legend(loc="lower right")
+        ax_resid.axhline(0, color="k", linewidth=0.8)
+        ax_resid.set_xlabel(x_conv_label)
+        ax_resid.set_ylabel("residual")
+        ax_resid.legend(loc="lower right")
+        fig.tight_layout(rect=(0, 0.04, 1, 1))
+        fig.savefig(
+            os.path.join(outdir, "stripe_psf_fit.png"),
+            dpi=200,
+        )
+        plt.close(fig)
 
     result = {
         "mode": "stripe",
@@ -688,25 +2048,41 @@ def analyze_stripe_roi(
         "roi_h": roi[3],
         "orientation": orientation,
         "angle_deg": angle_deg,
+        "psf_model": psf_model,
         "group": group,
         "element": element,
         "lp_per_mm": res["lp_per_mm"],
         "line_pair_period_um": res["line_pair_period_um"],
         "half_pitch_um": res["half_pitch_um"],
         "period_px": period_px,
-        "target_contrast": target_contrast,
-        "michelson_contrast": contrast,
-        "ctf": ctf,
-        "fundamental_modulation": fundamental_modulation,
-        "fundamental_mtf_estimate": fundamental_mtf_estimate,
+        "nominal_w_px": nominal_w_px,
+        "nominal_width_source": nominal_width_source,
+        "nominal_width_bound_lower_px": (
+            nominal_width_bounds[0] if nominal_width_bounds is not None else np.nan
+        ),
+        "nominal_width_bound_upper_px": (
+            nominal_width_bounds[1] if nominal_width_bounds is not None else np.nan
+        ),
+        "profile_band_axis": band_diag["band_axis"],
+        "profile_band_start_px": band_diag["band"][0],
+        "profile_band_end_px": band_diag["band"][1],
+        "profile_band_fraction": band_diag["band_fraction"],
+        "profile_band_trim_applied": band_diag["trim_applied"],
     }
-
+    result.update({
+        key: value
+        for key, value in conv_result.items()
+        if key not in ("conv_fit_profile", "conv_ideal_profile")
+    })
+    result.update({
+        key: value
+        for key, value in airy_result.items()
+        if key not in ("airy_fit_profile", "airy_ideal_profile")
+    })
     if orientation_diag is not None:
         result.update({
             "auto_vertical_score": orientation_diag["vertical"]["score"],
             "auto_horizontal_score": orientation_diag["horizontal"]["score"],
-            "auto_vertical_contrast": orientation_diag["vertical"]["contrast"],
-            "auto_horizontal_contrast": orientation_diag["horizontal"]["contrast"],
             "auto_x_gradient": orientation_diag["gradient"]["x_gradient"],
             "auto_y_gradient": orientation_diag["gradient"]["y_gradient"],
             "auto_gradient_orientation": orientation_diag["gradient"]["gradient_orientation"],
@@ -974,9 +2350,9 @@ def _score_triplet(
     orientation: str,
     img_shape: Tuple[int, int],
     polarity: str,
-    margin_factor: float = 0.8,
-    core_margin_factor: float = 0.25,
-    max_span_to_length: float = 1.8,
+    margin_factor: float = 0.20,
+    core_margin_factor: float = 0.05,
+    max_span_to_length: float = 1.5,
 ) -> Optional[StripeTriplet]:
     """Check whether three bars form a plausible USAF stripe triplet."""
     bars = list(triple)
@@ -1011,26 +2387,26 @@ def _score_triplet(
         return None
 
     spacing_err = abs(s1 - s2) / period_px
-    if spacing_err > 0.40:
+    if spacing_err > 0.25:
         return None
 
     align_err = float(np.std(perp_centers) / max(mean_length, 1.0))
-    if align_err > 0.35:
+    if align_err > 0.20:
         return None
 
     thickness_similarity = float(np.std(thicknesses) / mean_thickness)
     length_similarity = float(np.std(lengths) / mean_length)
 
-    if thickness_similarity > 0.70:
+    if thickness_similarity > 0.45:
         return None
-    if length_similarity > 0.70:
+    if length_similarity > 0.45:
         return None
 
     # For an ideal square-wave element, the center-to-center pitch is close to
-    # twice the bar width. Use broad bounds because thresholding/blur changes
-    # apparent width.
+    # twice the bar width. Keep this fairly strict so neighboring structures
+    # are less likely to be folded into the ROI.
     pitch_to_thickness = period_px / mean_thickness
-    if not (1.1 <= pitch_to_thickness <= 6.0):
+    if not (1.25 <= pitch_to_thickness <= 4.0):
         return None
 
     pitch_err = abs(pitch_to_thickness - 2.0) / 2.0
@@ -1055,13 +2431,54 @@ def _score_triplet(
     x1 = max(x1s)
     y1 = max(y1s)
 
-    margin = int(max(4, margin_factor * period_px))
-    core_margin = int(max(2, core_margin_factor * period_px))
+    across_margin = int(max(1, margin_factor * period_px))
+    along_margin = int(max(0, core_margin_factor * period_px))
+    core_margin = int(max(1, core_margin_factor * period_px))
 
-    roi = _clip_roi(
-        (x0 - margin, y0 - margin, (x1 - x0) + 2 * margin, (y1 - y0) + 2 * margin),
-        img_shape,
-    )
+    # The profile is averaged along the stripe direction. Keep that direction
+    # tight to the common bar support so dark surround/background does not
+    # dilute the averaged profile, while preserving some context across bars.
+    if orientation == "vertical":
+        common_y0 = max(y0s)
+        common_y1 = min(y1s)
+        if common_y1 - common_y0 >= 0.65 * mean_length:
+            roi_y0, roi_y1 = common_y0, common_y1
+        else:
+            center_y = float(np.median([b.cy for b in bars]))
+            support_len = 0.75 * float(np.min(lengths))
+            roi_y0 = int(round(center_y - 0.5 * support_len))
+            roi_y1 = int(round(center_y + 0.5 * support_len))
+
+        roi = _clip_roi(
+            (
+                x0 - across_margin,
+                int(round(roi_y0)) - along_margin,
+                (x1 - x0) + 2 * across_margin,
+                int(round(roi_y1 - roi_y0)) + 2 * along_margin,
+            ),
+            img_shape,
+        )
+
+    else:
+        common_x0 = max(x0s)
+        common_x1 = min(x1s)
+        if common_x1 - common_x0 >= 0.65 * mean_length:
+            roi_x0, roi_x1 = common_x0, common_x1
+        else:
+            center_x = float(np.median([b.cx for b in bars]))
+            support_len = 0.75 * float(np.min(lengths))
+            roi_x0 = int(round(center_x - 0.5 * support_len))
+            roi_x1 = int(round(center_x + 0.5 * support_len))
+
+        roi = _clip_roi(
+            (
+                int(round(roi_x0)) - along_margin,
+                y0 - across_margin,
+                int(round(roi_x1 - roi_x0)) + 2 * along_margin,
+                (y1 - y0) + 2 * across_margin,
+            ),
+            img_shape,
+        )
 
     # core_roi is deliberately tighter than roi. It is used only for validation:
     # if this tight region contains more than three same-orientation bars, then
@@ -1217,7 +2634,7 @@ def detect_usaf_stripe_triplets(
     max_triplets: Optional[int] = None,
     bg_sigma: float = 40.0,
     max_bars_per_roi: int = 3,
-    max_span_to_length: float = 1.8,
+    max_span_to_length: float = 1.5,
     verbose: bool = True,
 ) -> Tuple[List[StripeTriplet], Dict[str, object]]:
     """Automatically detect USAF stripe triplets in a full image."""
@@ -1404,14 +2821,18 @@ def analyze_auto_stripes(
     outdir: str,
     calibration: Optional[CameraCalibration] = None,
     polarity: str = "dark",
-    target_contrast: float = 1.0,
     min_area: int = 20,
     min_aspect: float = 2.0,
     max_candidates_per_orientation: int = 180,
     max_triplets: Optional[int] = 50,
     bg_sigma: float = 40.0,
     max_bars_per_roi: int = 3,
-    max_span_to_length: float = 1.8,
+    max_span_to_length: float = 1.5,
+    enable_convolution_mtf: bool = True,
+    convolution_fixed_width_px: Optional[float] = None,
+    fix_convolution_width: bool = False,
+    psf_model: str = "gaussian",
+    auto_trim_profile_band: bool = True,
 ) -> pd.DataFrame:
     """Detect and analyze all visible USAF stripe triplets in the image.
 
@@ -1490,11 +2911,16 @@ def analyze_auto_stripes(
             outdir=stripe_dir,
             group=nearest_group,
             element=nearest_element,
-            lpmm=measured_lpmm,
+            lpmm=nearest_lpmm,
             period_px=t.period_px,
             calibration=calibration,
-            target_contrast=target_contrast,
             angle_deg=0.0,
+            enable_convolution_mtf=enable_convolution_mtf,
+            convolution_initial_width_px=t.bar_thickness_px,
+            convolution_fixed_width_px=convolution_fixed_width_px,
+            fix_convolution_width=fix_convolution_width,
+            psf_model=psf_model,
+            auto_trim_profile_band=auto_trim_profile_band,
         )
 
         row = df_one.iloc[0].to_dict()
@@ -1531,14 +2957,29 @@ def analyze_auto_stripes(
             "auto_index",
             "display_label",
             "orientation",
+            "psf_model",
             "roi_x",
             "roi_y",
             "roi_w",
             "roi_h",
             "detected_period_px",
             "detected_local_bar_count",
-            "ctf",
-            "fundamental_mtf_estimate",
+            "nominal_w_px",
+            "nominal_width_source",
+            "conv_w_um",
+            "conv_width_fixed",
+            "conv_stripe_spacing_um",
+            "conv_width_bound_lower_um",
+            "conv_width_bound_upper_um",
+            "conv_sigma_um",
+            "conv_sigma_uncertainty_um",
+            "conv_rayleigh_equivalent_resolution_um",
+            "conv_rayleigh_equivalent_resolution_uncertainty_um",
+            "conv_fit_rmse",
+            "airy_r0_um",
+            "airy_rayleigh_resolution_um",
+            "airy_width_fixed",
+            "airy_fit_rmse",
             "detection_score",
         ]
         cols = [c for c in cols if c in summary.columns]
@@ -2040,10 +3481,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Known stripe period in pixels.",
     )
     p_stripe.add_argument(
-        "--target-contrast",
+        "--psf-model",
+        choices=["gaussian", "airy", "both"],
+        default="gaussian",
+        help="PSF model for the real-space three-bar fit.",
+    )
+    p_stripe.add_argument(
+        "--convolution-width-px",
         type=float,
-        default=1.0,
-        help="Intrinsic target Michelson contrast. Use 1.0 for ideal high-contrast USAF.",
+        default=None,
+        help="Known bar width in pixels for the PSF fit; if set, width is fixed.",
+    )
+    p_stripe.add_argument(
+        "--fix-convolution-width",
+        action="store_true",
+        help=(
+            "Fix PSF-fit bar width to the available estimate. Nominal USAF width "
+            "is already fixed automatically when group/element and calibration are known."
+        ),
+    )
+    p_stripe.add_argument(
+        "--no-auto-trim-profile-band",
+        action="store_true",
+        help="Disable automatic trimming of the stripe-direction averaging band.",
     )
 
     # Auto-stripes mode.
@@ -2063,10 +3523,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_auto.add_argument(
-        "--target-contrast",
+        "--psf-model",
+        choices=["gaussian", "airy", "both"],
+        default="gaussian",
+        help="PSF model for the real-space three-bar fit.",
+    )
+    p_auto.add_argument(
+        "--convolution-width-px",
         type=float,
-        default=1.0,
-        help="Intrinsic target Michelson contrast.",
+        default=None,
+        help="Known bar width in pixels for the PSF fit; if set, width is fixed for every ROI.",
+    )
+    p_auto.add_argument(
+        "--fix-convolution-width",
+        action="store_true",
+        help=(
+            "Fix PSF-fit bar width to the detected estimate when no nominal USAF "
+            "width is available. Nominal USAF width is fixed automatically."
+        ),
+    )
+    p_auto.add_argument(
+        "--no-auto-trim-profile-band",
+        action="store_true",
+        help="Disable automatic trimming of the stripe-direction averaging band.",
     )
     p_auto.add_argument(
         "--min-area",
@@ -2111,7 +3590,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_auto.add_argument(
         "--max-span-to-length",
         type=float,
-        default=1.8,
+        default=1.5,
         help=(
             "Reject triplets whose total center span is too large compared "
             "with individual bar length. Lower values are stricter."
@@ -2192,8 +3671,11 @@ def main() -> None:
             lpmm=args.lpmm,
             period_px=args.period_px,
             calibration=calibration,
-            target_contrast=args.target_contrast,
             angle_deg=args.angle_deg,
+            convolution_fixed_width_px=args.convolution_width_px,
+            fix_convolution_width=args.fix_convolution_width,
+            psf_model=args.psf_model,
+            auto_trim_profile_band=not args.no_auto_trim_profile_band,
         )
 
     elif args.mode == "auto-stripes":
@@ -2219,7 +3701,6 @@ def main() -> None:
             outdir=args.outdir,
             calibration=calibration,
             polarity=args.polarity,
-            target_contrast=args.target_contrast,
             min_area=args.min_area,
             min_aspect=args.min_aspect,
             max_candidates_per_orientation=args.max_candidates_per_orientation,
@@ -2227,6 +3708,10 @@ def main() -> None:
             bg_sigma=args.bg_sigma,
             max_bars_per_roi=args.max_bars_per_roi,
             max_span_to_length=args.max_span_to_length,
+            convolution_fixed_width_px=args.convolution_width_px,
+            fix_convolution_width=args.fix_convolution_width,
+            psf_model=args.psf_model,
+            auto_trim_profile_band=not args.no_auto_trim_profile_band,
         )
 
     elif args.mode == "edge":
