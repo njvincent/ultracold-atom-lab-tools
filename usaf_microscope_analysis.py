@@ -18,7 +18,13 @@ Main modes
    Analyze one selected square/edge ROI using ESF -> Gaussian LSF -> MTF estimate.
 
 4. square
-   Analyze a full square ROI by automatically finding four edges.
+   Analyze one USAF square ROI. The square side length is fixed from the
+   supplied group/element geometry, and Gaussian sigma is fit separately along
+   the horizontal and vertical image axes.
+
+5. auto-squares
+   Automatically detect one or more USAF square targets, then run square
+   analysis on each detected ROI.
 
 Dependencies
 ------------
@@ -78,9 +84,15 @@ Edge analysis:
 Square analysis:
     python usaf_microscope_analysis.py square \
         --image square.tif \
-        --pixel-size-um 6.5 \
-        --magnification 10 \
+        --group 6 \
         --outdir square_analysis
+
+Automatic square detection:
+    python usaf_microscope_analysis.py auto-squares \
+        --image usaf.tif \
+        --group 6 \
+        --polarity dark \
+        --outdir auto_squares
 """
 
 from __future__ import annotations
@@ -110,6 +122,7 @@ from scipy.special import erf, j1
 
 
 GAUSSIAN_RAYLEIGH_EQUIVALENT_FACTOR = 2.898785
+USAF_SQUARE_SIDE_BAR_WIDTHS = 5.0
 
 
 # ============================================================
@@ -121,11 +134,22 @@ class CameraCalibration:
     pixel_size_um: Optional[float] = None
     magnification: Optional[float] = None
     binning: int = 1
+    object_pixel_size_um: Optional[float] = None
 
     @property
     def object_pixel_um(self) -> Optional[float]:
-        if self.pixel_size_um is None or self.magnification is None:
+        if self.object_pixel_size_um is not None:
+            if self.object_pixel_size_um <= 0:
+                raise ValueError("object pixel size must be positive")
+            return self.object_pixel_size_um
+        if self.pixel_size_um is None:
             return None
+        if self.pixel_size_um <= 0:
+            raise ValueError("pixel size must be positive")
+        if self.magnification is None:
+            # If magnification is omitted, treat --pixel-size-um as the
+            # calibrated object-space image pixel size.
+            return self.pixel_size_um
         if self.magnification == 0:
             raise ValueError("magnification must be nonzero")
         return self.pixel_size_um * self.binning / self.magnification
@@ -133,6 +157,21 @@ class CameraCalibration:
 
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
+
+def calibration_with_object_pixel_um(
+    calibration: Optional[CameraCalibration],
+    object_pixel_um: float,
+) -> CameraCalibration:
+    """Return a calibration that uses an inferred or supplied object pixel size."""
+    if calibration is None:
+        calibration = CameraCalibration()
+    return CameraCalibration(
+        pixel_size_um=calibration.pixel_size_um,
+        magnification=calibration.magnification,
+        binning=calibration.binning,
+        object_pixel_size_um=float(object_pixel_um),
+    )
 
 
 def read_tiff_image(
@@ -423,6 +462,11 @@ def usaf_lpmm(group: int, element: int) -> float:
     return 2 ** (group + (element - 1) / 6)
 
 
+def usaf_square_lpmm(group: int) -> float:
+    """Return the USAF frequency used to size the single square for a group."""
+    return usaf_lpmm(group, 2)
+
+
 def resolution_from_lpmm(lpmm: float) -> Dict[str, float]:
     period_um = 1000.0 / lpmm
     half_pitch_um = 1000.0 / (2.0 * lpmm)
@@ -450,6 +494,30 @@ def nominal_bar_width_px_from_lpmm(
 
     line_pair_period_um = 1000.0 / lpmm
     return line_pair_period_um / (2.0 * obj_px_um)
+
+
+def nominal_usaf_square_side_um_from_lpmm(lpmm: Optional[float]) -> float:
+    """Return the standard square side length for a USAF element in object-space um."""
+    if lpmm is None or not np.isfinite(lpmm) or lpmm <= 0:
+        return np.nan
+    bar_width_um = 1000.0 / (2.0 * lpmm)
+    return USAF_SQUARE_SIDE_BAR_WIDTHS * bar_width_um
+
+
+def nominal_usaf_square_side_px_from_lpmm(
+    lpmm: Optional[float],
+    calibration: Optional[CameraCalibration],
+) -> float:
+    """Return the standard square side length in image pixels when calibration allows it."""
+    side_um = nominal_usaf_square_side_um_from_lpmm(lpmm)
+    if not np.isfinite(side_um):
+        return np.nan
+    if calibration is None or calibration.object_pixel_um is None:
+        return np.nan
+    obj_px_um = calibration.object_pixel_um
+    if not np.isfinite(obj_px_um) or obj_px_um <= 0:
+        return np.nan
+    return side_um / obj_px_um
 
 
 def width_bounds_around_nominal(
@@ -727,6 +795,21 @@ def format_value_with_uncertainty(value: float, uncertainty: float) -> str:
 
     value_text = f"{value:.{decimal_places}f}"
     return f"{value_text}({uncertainty_digits})"
+
+
+def format_usaf_label(
+    group: Optional[int],
+    element: Optional[int] = None,
+    square: bool = False,
+) -> str:
+    """Return a compact USAF label for plot annotations."""
+    if group is None:
+        return "USAF: unspecified"
+    if square:
+        return f"USAF G{group} square (E2 scale)"
+    if element is None:
+        return f"USAF G{group}"
+    return f"USAF G{group}E{element}"
 
 
 def three_bar_ideal_profile(
@@ -1547,6 +1630,221 @@ def fit_gaussian_psf_profile(
     return result
 
 
+def fit_single_square_axis_profile(
+    profile: np.ndarray,
+    fixed_side_px: float,
+    pixel_size_um: Optional[float] = None,
+) -> Dict[str, object]:
+    """
+    Fit one axis projection of a square target with a fixed top-hat side length
+    convolved with a Gaussian LSF.
+    """
+    y = np.asarray(profile, dtype=float)
+    x = np.arange(len(y), dtype=float)
+    result = _empty_convolution_result("not run")
+
+    if not np.isfinite(fixed_side_px) or fixed_side_px <= 0:
+        result["conv_fit_message"] = "fixed square side length is unavailable"
+        return result
+
+    try:
+        finite = np.isfinite(y)
+        if finite.sum() < 6:
+            raise ValueError("not enough finite profile samples")
+
+        x_fit = x[finite]
+        y_fit = y[finite]
+        y_min = float(np.nanmin(y_fit))
+        y_max = float(np.nanmax(y_fit))
+        y_med = float(np.nanmedian(y_fit))
+        y_ptp = max(y_max - y_min, np.finfo(float).eps)
+        x_min = float(np.nanmin(x_fit))
+        x_max = float(np.nanmax(x_fit))
+        x_span = max(x_max - x_min, 1.0)
+
+        smooth_sigma = max(0.75, min(3.0, 0.03 * len(y)))
+        y_smooth = gaussian_filter1d(y.astype(float), smooth_sigma)
+        bright_contrast = float(np.nanmax(y_smooth) - np.nanmedian(y_smooth))
+        dark_contrast = float(np.nanmedian(y_smooth) - np.nanmin(y_smooth))
+        polarity_sign = 1.0 if bright_contrast >= dark_contrast else -1.0
+        feature_signal = polarity_sign * (y_smooth - np.nanmedian(y_smooth))
+        if np.any(np.isfinite(feature_signal)):
+            weights = np.maximum(feature_signal, 0.0)
+            if np.sum(weights) > np.finfo(float).eps:
+                x0_guess = float(np.sum(x * weights) / np.sum(weights))
+            else:
+                x0_guess = 0.5 * (x_min + x_max)
+        else:
+            x0_guess = 0.5 * (x_min + x_max)
+
+        slope_guess = 0.0
+        try:
+            slope_guess = float(np.polyfit(x_fit, y_fit, deg=1)[0])
+        except Exception:
+            slope_guess = 0.0
+
+        center_guess_from_edges = None
+        try:
+            edge0, edge1 = find_two_edge_positions_1d(y_smooth)
+            center_guess_from_edges = 0.5 * (edge0 + edge1)
+            x0_guess = float(center_guess_from_edges)
+        except Exception:
+            pass
+
+        x0_margin = max(2.0, 0.35 * fixed_side_px)
+        if center_guess_from_edges is not None:
+            x0_lower = max(x_min, x0_guess - x0_margin)
+            x0_upper = min(x_max, x0_guess + x0_margin)
+            if x0_upper <= x0_lower:
+                x0_lower, x0_upper = x_min, x_max
+        else:
+            x0_lower, x0_upper = x_min, x_max
+
+        sigma0 = max(0.35, 0.04 * fixed_side_px)
+        sigma_upper = max(0.75, min(0.75 * x_span, 0.35 * fixed_side_px))
+        lower = np.array([
+            y_min - y_ptp,
+            -2.0 * y_ptp / x_span,
+            -2.5 * y_ptp,
+            x0_lower,
+            0.1,
+        ])
+        upper = np.array([
+            y_max + y_ptp,
+            2.0 * y_ptp / x_span,
+            2.5 * y_ptp,
+            x0_upper,
+            sigma_upper,
+        ])
+        p0 = np.array([
+            y_med,
+            slope_guess,
+            polarity_sign * y_ptp,
+            x0_guess,
+            sigma0,
+        ])
+        p0 = np.clip(p0, lower, upper)
+
+        def model(xvals, b0, b1, A, x0, sigma):
+            return b0 + b1 * xvals + A * blurred_bar_profile(
+                xvals,
+                x0,
+                fixed_side_px,
+                sigma,
+            )
+
+        def residuals(params):
+            return model(x_fit, *params) - y_fit
+
+        opt = least_squares(
+            residuals,
+            p0,
+            bounds=(lower, upper),
+            loss="linear",
+            max_nfev=20000,
+        )
+
+        if not opt.success:
+            raise RuntimeError(opt.message)
+
+        b0, b1, A, x0_fit, sigma_px = opt.x
+        if sigma_px <= 0 or x0_fit < x_min or x0_fit > x_max:
+            raise RuntimeError("fit returned unphysical parameters")
+
+        y_model = model(x, b0, b1, A, x0_fit, sigma_px)
+        ideal = b0 + b1 * x + A * (
+            np.abs(x - x0_fit) < 0.5 * fixed_side_px
+        ).astype(float)
+        residual = y - y_model
+        residual_finite = residual[np.isfinite(residual)]
+        rmse = float(np.sqrt(np.mean(residual_finite ** 2))) if residual_finite.size else np.nan
+        sse = float(np.sum(residuals(opt.x) ** 2))
+        sst = float(np.sum((y_fit - np.mean(y_fit)) ** 2))
+        r2 = np.nan if sst <= np.finfo(float).eps else float(1.0 - sse / sst)
+        parameter_errors = parameter_standard_errors(opt.jac, residuals(opt.x))
+        sigma_uncertainty_px = float(parameter_errors[-1])
+
+        object_pixel_um = np.nan
+        object_pixel_mm = np.nan
+        sigma_um = np.nan
+        sigma_mm = np.nan
+        sigma_uncertainty_um = np.nan
+        sigma_uncertainty_mm = np.nan
+        side_um = np.nan
+        side_mm = np.nan
+        x0_um = np.nan
+        x0_mm = np.nan
+        slope_per_um = np.nan
+        slope_per_mm = np.nan
+        if pixel_size_um is not None and np.isfinite(pixel_size_um) and pixel_size_um > 0:
+            object_pixel_um = float(pixel_size_um)
+            object_pixel_mm = object_pixel_um / 1000.0
+            sigma_um = sigma_px * object_pixel_um
+            sigma_mm = sigma_um / 1000.0
+            sigma_uncertainty_um = sigma_uncertainty_px * object_pixel_um
+            sigma_uncertainty_mm = sigma_uncertainty_um / 1000.0
+            side_um = fixed_side_px * object_pixel_um
+            side_mm = side_um / 1000.0
+            x0_um = x0_fit * object_pixel_um
+            x0_mm = x0_fit * object_pixel_mm
+            slope_per_um = b1 / object_pixel_um
+            slope_per_mm = b1 / object_pixel_mm
+
+        rayleigh_px = GAUSSIAN_RAYLEIGH_EQUIVALENT_FACTOR * sigma_px
+        rayleigh_unc_px = GAUSSIAN_RAYLEIGH_EQUIVALENT_FACTOR * sigma_uncertainty_px
+        rayleigh_um = rayleigh_px * object_pixel_um if np.isfinite(object_pixel_um) else np.nan
+        rayleigh_mm = rayleigh_um / 1000.0 if np.isfinite(rayleigh_um) else np.nan
+        rayleigh_unc_um = (
+            rayleigh_unc_px * object_pixel_um if np.isfinite(object_pixel_um) else np.nan
+        )
+        rayleigh_unc_mm = (
+            rayleigh_unc_um / 1000.0 if np.isfinite(rayleigh_unc_um) else np.nan
+        )
+
+        result.update({
+            "conv_fit_success": True,
+            "conv_sigma_px": float(sigma_px),
+            "conv_sigma_um": sigma_um,
+            "conv_sigma_mm": sigma_mm,
+            "conv_sigma_uncertainty_px": sigma_uncertainty_px,
+            "conv_sigma_uncertainty_um": sigma_uncertainty_um,
+            "conv_sigma_uncertainty_mm": sigma_uncertainty_mm,
+            "conv_rayleigh_equivalent_resolution_px": rayleigh_px,
+            "conv_rayleigh_equivalent_resolution_um": rayleigh_um,
+            "conv_rayleigh_equivalent_resolution_mm": rayleigh_mm,
+            "conv_rayleigh_equivalent_resolution_uncertainty_px": rayleigh_unc_px,
+            "conv_rayleigh_equivalent_resolution_uncertainty_um": rayleigh_unc_um,
+            "conv_rayleigh_equivalent_resolution_uncertainty_mm": rayleigh_unc_mm,
+            "conv_object_pixel_um": object_pixel_um,
+            "conv_object_pixel_mm": object_pixel_mm,
+            "conv_frequency_scale_source": "calibration" if np.isfinite(object_pixel_um) else "none",
+            "conv_w_px": float(fixed_side_px),
+            "conv_w_um": side_um,
+            "conv_w_mm": side_mm,
+            "conv_width_fixed": True,
+            "conv_x0_px": float(x0_fit),
+            "conv_x0_um": x0_um,
+            "conv_x0_mm": x0_mm,
+            "conv_amplitude": float(A),
+            "conv_background_offset": float(b0),
+            "conv_background_slope": float(b1),
+            "conv_background_slope_per_px": float(b1),
+            "conv_background_slope_per_um": slope_per_um,
+            "conv_background_slope_per_mm": slope_per_mm,
+            "conv_fit_rmse": rmse,
+            "conv_fit_chi_squared": sse,
+            "conv_fit_r2": r2,
+            "conv_fit_message": opt.message,
+            "conv_fit_profile": y_model,
+            "conv_ideal_profile": ideal,
+        })
+
+    except Exception as exc:
+        result["conv_fit_message"] = str(exc)
+
+    return result
+
+
 # Backward-compatible name for notebooks written before the PSF-fit cleanup.
 fit_convolution_mtf_profile = fit_gaussian_psf_profile
 
@@ -1645,6 +1943,129 @@ def auto_detect_stripe_orientation(
     return orientation, diagnostics
 
 
+def _rotate_crop_for_analysis(crop: np.ndarray, angle_deg: float) -> np.ndarray:
+    """Rotate an already-cropped image while keeping its array size fixed."""
+    if not np.isfinite(angle_deg) or abs(angle_deg) < 1e-9:
+        return crop
+    return rotate(
+        crop,
+        float(angle_deg),
+        reshape=False,
+        order=1,
+        mode="nearest",
+    )
+
+
+def _scan_rotation_angle(
+    crop: np.ndarray,
+    score_func,
+    max_angle_deg: float = 8.0,
+    step_deg: float = 0.5,
+) -> Tuple[float, float]:
+    """Return the angle with the highest supplied alignment score."""
+    if max_angle_deg <= 0 or step_deg <= 0:
+        return 0.0, float(score_func(crop))
+
+    angles = np.arange(
+        -abs(float(max_angle_deg)),
+        abs(float(max_angle_deg)) + 0.5 * float(step_deg),
+        float(step_deg),
+    )
+    best_angle = 0.0
+    best_score = -np.inf
+
+    for angle in angles:
+        rotated = _rotate_crop_for_analysis(crop, float(angle))
+        try:
+            score = float(score_func(rotated))
+        except Exception:
+            score = -np.inf
+        if score > best_score:
+            best_score = score
+            best_angle = float(angle)
+
+    if not np.isfinite(best_score):
+        return 0.0, np.nan
+    return best_angle, best_score
+
+
+def estimate_stripe_rotation_angle(
+    crop: np.ndarray,
+    expected_period_px: Optional[float] = None,
+    max_angle_deg: float = 8.0,
+    step_deg: float = 0.5,
+) -> Tuple[float, float]:
+    """Estimate small deskew angle for a stripe ROI from projection periodicity."""
+    def score(rotated_crop: np.ndarray) -> float:
+        scores = []
+        for orientation in ("vertical", "horizontal"):
+            profile = extract_bar_profile(rotated_crop, orientation)
+            scores.append(
+                profile_periodic_score(
+                    profile,
+                    expected_period_px=expected_period_px,
+                )["score"]
+            )
+        return float(np.nanmax(scores))
+
+    return _scan_rotation_angle(
+        crop,
+        score,
+        max_angle_deg=max_angle_deg,
+        step_deg=step_deg,
+    )
+
+
+def _projection_two_edge_score(profile: np.ndarray) -> float:
+    """Score how sharp the two dominant edges are in a 1D projection."""
+    p = gaussian_filter1d(np.asarray(profile, dtype=float), sigma=2.0)
+    if len(p) < 6:
+        return 0.0
+    g = np.abs(np.gradient(p))
+    min_distance = max(3, int(len(p) * 0.25))
+    peaks, _props = find_peaks(
+        g,
+        distance=min_distance,
+        prominence=max(np.std(g) * 0.25, np.finfo(float).eps),
+    )
+
+    if len(peaks) >= 2:
+        chosen = peaks[np.argsort(g[peaks])[-2:]]
+        return float(np.sum(g[chosen]))
+
+    chosen = []
+    for idx in np.argsort(g)[::-1]:
+        if all(abs(int(idx) - int(c)) >= min_distance for c in chosen):
+            chosen.append(int(idx))
+        if len(chosen) == 2:
+            break
+    if len(chosen) < 2:
+        return 0.0
+    return float(np.sum(g[chosen]))
+
+
+def estimate_square_rotation_angle(
+    crop: np.ndarray,
+    max_angle_deg: float = 8.0,
+    step_deg: float = 0.5,
+) -> Tuple[float, float]:
+    """Estimate small deskew angle for a square ROI from projection edge sharpness."""
+    def score(rotated_crop: np.ndarray) -> float:
+        x_projection = rotated_crop.mean(axis=0)
+        y_projection = rotated_crop.mean(axis=1)
+        return (
+            _projection_two_edge_score(x_projection)
+            + _projection_two_edge_score(y_projection)
+        )
+
+    return _scan_rotation_angle(
+        crop,
+        score,
+        max_angle_deg=max_angle_deg,
+        step_deg=step_deg,
+    )
+
+
 def analyze_stripe_roi(
     img: np.ndarray,
     roi: Tuple[int, int, int, int],
@@ -1662,6 +2083,9 @@ def analyze_stripe_roi(
     fix_convolution_width: bool = False,
     psf_model: str = "gaussian",
     auto_trim_profile_band: bool = True,
+    auto_rotate: bool = True,
+    auto_rotate_max_deg: float = 8.0,
+    auto_rotate_step_deg: float = 0.5,
 ) -> pd.DataFrame:
     """
     Analyze one USAF stripe ROI.
@@ -1671,7 +2095,6 @@ def analyze_stripe_roi(
     ensure_dir(outdir)
 
     crop = crop_roi(img, roi, angle_deg=angle_deg)
-    save_crop_plot(crop, os.path.join(outdir, "stripe_roi.png"), "Stripe ROI")
 
     if calibration is None:
         calibration = CameraCalibration()
@@ -1701,6 +2124,29 @@ def analyze_stripe_roi(
         nominal_width_source = "input_period_px"
 
     nominal_width_bounds = width_bounds_around_nominal(nominal_w_px)
+
+    auto_rotation_angle_deg = 0.0
+    auto_rotation_score = np.nan
+    if auto_rotate:
+        auto_rotation_angle_deg, auto_rotation_score = estimate_stripe_rotation_angle(
+            crop,
+            expected_period_px=expected_period_px,
+            max_angle_deg=auto_rotate_max_deg,
+            step_deg=auto_rotate_step_deg,
+        )
+        crop = _rotate_crop_for_analysis(crop, auto_rotation_angle_deg)
+        print(
+            "Auto stripe rotation: "
+            f"{auto_rotation_angle_deg:.4g} deg "
+            f"(score={auto_rotation_score:.4g})"
+        )
+
+    analysis_angle_deg = angle_deg + auto_rotation_angle_deg
+    save_crop_plot(
+        crop,
+        os.path.join(outdir, "stripe_roi.png"),
+        f"Stripe ROI - {format_usaf_label(group, element)}",
+    )
 
     # Auto-detect orientation if not provided.
     orientation_diag = None
@@ -2008,7 +2454,7 @@ def analyze_stripe_roi(
             fig.text(
                 0.5,
                 0.01,
-                spacing_label,
+                f"{format_usaf_label(group, element)}; {spacing_label}",
                 ha="center",
                 va="bottom",
                 fontsize=9,
@@ -2047,7 +2493,10 @@ def analyze_stripe_roi(
         "roi_w": roi[2],
         "roi_h": roi[3],
         "orientation": orientation,
-        "angle_deg": angle_deg,
+        "angle_deg": analysis_angle_deg,
+        "input_angle_deg": angle_deg,
+        "auto_rotation_angle_deg": auto_rotation_angle_deg,
+        "auto_rotation_score": auto_rotation_score,
         "psf_model": psf_model,
         "group": group,
         "element": element,
@@ -2129,6 +2578,23 @@ class StripeTriplet:
     span_to_length: float
     pitch_to_thickness: float
     local_bar_count: int = 3
+
+
+@dataclass
+class SquareCandidate:
+    component_id: int
+    roi: Tuple[int, int, int, int]
+    bbox: Tuple[int, int, int, int]
+    cx: float
+    cy: float
+    w: int
+    h: int
+    area: int
+    fill_fraction: float
+    aspect_ratio: float
+    side_px: float
+    score: float
+    polarity: str
 
 
 def otsu_threshold(arr: np.ndarray, nbins: int = 256) -> float:
@@ -2993,6 +3459,456 @@ def analyze_auto_stripes(
 
 
 # ============================================================
+# Automatic USAF square extraction
+# ============================================================
+
+def find_square_candidates(
+    mask: np.ndarray,
+    img: np.ndarray,
+    polarity: str,
+    expected_side_px: Optional[float] = None,
+    min_area: int = 20,
+    max_aspect_error: float = 0.35,
+    min_fill_fraction: float = 0.25,
+    roi_margin_fraction: float = 0.35,
+) -> List[SquareCandidate]:
+    """Find compact connected components that could be USAF square targets."""
+    labeled, _n = label(mask, structure=np.ones((3, 3), dtype=int))
+    slices = find_objects(labeled)
+    candidates: List[SquareCandidate] = []
+
+    for i, sl in enumerate(slices):
+        if sl is None:
+            continue
+
+        ys, xs = sl
+        y0, y1 = ys.start, ys.stop
+        x0, x1 = xs.start, xs.stop
+        w = x1 - x0
+        h = y1 - y0
+        if w <= 0 or h <= 0:
+            continue
+
+        comp = labeled[ys, xs] == (i + 1)
+        area = int(comp.sum())
+        if area < min_area:
+            continue
+
+        fill_fraction = area / float(w * h)
+        if fill_fraction < min_fill_fraction:
+            continue
+
+        aspect_ratio = max(w / h, h / w)
+        aspect_error = aspect_ratio - 1.0
+        if aspect_error > max_aspect_error:
+            continue
+
+        yy, xx = np.nonzero(comp)
+        cx = x0 + float(xx.mean())
+        cy = y0 + float(yy.mean())
+        measured_side_px = 0.5 * (w + h)
+
+        side_error = 0.0
+        roi_side = measured_side_px
+        if (
+            expected_side_px is not None
+            and np.isfinite(expected_side_px)
+            and expected_side_px > 0
+        ):
+            side_error = abs(measured_side_px - expected_side_px) / expected_side_px
+            # Thresholded blurred objects can be narrower than the true square.
+            # Keep this permissive while still ranking nominal-size matches first.
+            if side_error > 0.75:
+                continue
+            roi_side = expected_side_px
+
+        margin = max(2.0, roi_margin_fraction * roi_side)
+        roi_size = int(round(roi_side + 2.0 * margin))
+        roi = _clip_roi(
+            (
+                int(round(cx - 0.5 * roi_size)),
+                int(round(cy - 0.5 * roi_size)),
+                roi_size,
+                roi_size,
+            ),
+            img.shape,
+        )
+
+        roi_crop = crop_roi(img, roi)
+        roi_contrast = float(np.nanpercentile(roi_crop, 95) - np.nanpercentile(roi_crop, 5))
+        contrast_scale = max(abs(float(np.nanmedian(img))), 1.0)
+        contrast_score = roi_contrast / contrast_scale
+
+        score = 1.0 / (
+            1.0
+            + 2.5 * aspect_error
+            + 2.0 * side_error
+            + abs(fill_fraction - 0.75)
+            + 0.2 / max(contrast_score, 1e-6)
+        )
+
+        candidates.append(
+            SquareCandidate(
+                component_id=i + 1,
+                roi=roi,
+                bbox=(x0, y0, w, h),
+                cx=cx,
+                cy=cy,
+                w=w,
+                h=h,
+                area=area,
+                fill_fraction=float(fill_fraction),
+                aspect_ratio=float(aspect_ratio),
+                side_px=float(measured_side_px),
+                score=float(score),
+                polarity=polarity,
+            )
+        )
+
+    return candidates
+
+
+def nonmax_suppress_squares(
+    squares: List[SquareCandidate],
+    iou_threshold: float = 0.25,
+) -> List[SquareCandidate]:
+    """Remove duplicate square detections using ROI overlap."""
+    squares = sorted(squares, key=lambda s: s.score, reverse=True)
+    kept: List[SquareCandidate] = []
+    for s in squares:
+        if all(_roi_iou(s.roi, k.roi) <= iou_threshold for k in kept):
+            kept.append(s)
+    return kept
+
+
+def detect_usaf_squares(
+    img: np.ndarray,
+    polarity: str = "dark",
+    expected_side_px: Optional[float] = None,
+    min_area: int = 20,
+    max_aspect_error: float = 0.35,
+    min_fill_fraction: float = 0.25,
+    max_squares: Optional[int] = None,
+    bg_sigma: float = 40.0,
+    verbose: bool = True,
+) -> Tuple[List[SquareCandidate], Dict[str, object]]:
+    """Automatically detect compact USAF square targets in an image."""
+    mask, used_polarity, threshold, norm = make_feature_mask(
+        img,
+        polarity=polarity,
+        bg_sigma=bg_sigma,
+    )
+
+    candidates = find_square_candidates(
+        mask=mask,
+        img=img,
+        polarity=used_polarity,
+        expected_side_px=expected_side_px,
+        min_area=min_area,
+        max_aspect_error=max_aspect_error,
+        min_fill_fraction=min_fill_fraction,
+    )
+    squares = nonmax_suppress_squares(candidates, iou_threshold=0.25)
+    if max_squares is not None:
+        squares = squares[:max_squares]
+    squares = sorted(squares, key=lambda s: (s.roi[1], s.roi[0], -s.score))
+
+    if verbose:
+        print("\nAuto square detection:")
+        print(f"  polarity used: {used_polarity}")
+        print(f"  threshold: {threshold:.4g}")
+        print(f"  square candidates before NMS: {len(candidates)}")
+        print(f"  square candidates after NMS: {len(squares)}")
+
+    debug = {
+        "mask": mask,
+        "norm": norm,
+        "threshold": threshold,
+        "polarity": used_polarity,
+        "candidates": candidates,
+    }
+    return squares, debug
+
+
+def plot_detected_squares(
+    img: np.ndarray,
+    squares: List[SquareCandidate],
+    path: str,
+    labels: Optional[List[str]] = None,
+    title: str = "Detected USAF squares",
+) -> None:
+    """Save diagnostic plot showing detected square ROIs."""
+    from matplotlib.patches import Rectangle
+
+    annotation_color = "#00E5FF"
+    if labels is None:
+        labels = [str(i) for i in range(len(squares))]
+    if len(labels) != len(squares):
+        raise ValueError("labels must have the same length as squares")
+
+    plt.figure(figsize=(10, 8))
+    ax = plt.gca()
+    ax.imshow(img, cmap="gray", origin="upper")
+
+    for s, label_text in zip(squares, labels):
+        x0, y0, w, h = s.roi
+        lw = float(np.clip(0.8 + 0.015 * min(w, h), 1.2, 2.5))
+        rect = Rectangle(
+            (x0, y0),
+            w,
+            h,
+            fill=False,
+            edgecolor=annotation_color,
+            linewidth=lw,
+        )
+        ax.add_patch(rect)
+
+        fs = float(np.clip(3.5 + 0.04 * min(w, h), 5.0, 8.0))
+        tx = x0 + 1
+        ty = y0 - 2 if y0 >= 10 else y0 + 2
+        va = "bottom" if y0 >= 10 else "top"
+        ax.text(
+            tx,
+            ty,
+            str(label_text),
+            fontsize=fs,
+            color="white",
+            fontweight="bold",
+            verticalalignment=va,
+            horizontalalignment="left",
+            bbox=dict(
+                boxstyle="round,pad=0.12",
+                facecolor=annotation_color,
+                edgecolor="white",
+                linewidth=0.6,
+                alpha=0.95,
+            ),
+            clip_on=True,
+            zorder=5,
+        )
+
+    ax.set_title(title + "\n(see CSV for full details)")
+    plt.tight_layout()
+    plt.savefig(path, dpi=240, bbox_inches="tight")
+    plt.close()
+
+
+def autocrop_square_roi_from_projection(
+    img: np.ndarray,
+    expected_side_px: Optional[float] = None,
+    margin_fraction: float = 0.35,
+) -> Tuple[Tuple[int, int, int, int], Dict[str, float]]:
+    """
+    Auto-crop one square inside a rough user-selected region.
+
+    This is deliberately local and projection-based: after the user narrows the
+    search zone, the strongest pair of vertical and horizontal square edges is
+    enough to center a tight ROI without relying on global segmentation.
+    """
+    x_projection = img.mean(axis=0)
+    y_projection = img.mean(axis=1)
+
+    left_x, right_x = find_two_edge_positions_1d(x_projection)
+    top_y, bottom_y = find_two_edge_positions_1d(y_projection)
+
+    measured_w = max(1.0, float(right_x - left_x))
+    measured_h = max(1.0, float(bottom_y - top_y))
+    measured_side_px = 0.5 * (measured_w + measured_h)
+
+    if (
+        expected_side_px is not None
+        and np.isfinite(expected_side_px)
+        and expected_side_px > 0
+    ):
+        side_px = float(expected_side_px)
+    else:
+        side_px = measured_side_px
+
+    cx = 0.5 * (left_x + right_x)
+    cy = 0.5 * (top_y + bottom_y)
+    margin = max(2.0, margin_fraction * side_px)
+    roi_size = int(round(side_px + 2.0 * margin))
+    roi = _clip_roi(
+        (
+            int(round(cx - 0.5 * roi_size)),
+            int(round(cy - 0.5 * roi_size)),
+            roi_size,
+            roi_size,
+        ),
+        img.shape,
+    )
+
+    diagnostics = {
+        "left_x": float(left_x),
+        "right_x": float(right_x),
+        "top_y": float(top_y),
+        "bottom_y": float(bottom_y),
+        "center_x": float(cx),
+        "center_y": float(cy),
+        "measured_width_px": measured_w,
+        "measured_height_px": measured_h,
+        "measured_side_px": measured_side_px,
+        "crop_side_px": float(side_px),
+        "roi_margin_px": float(margin),
+    }
+    return roi, diagnostics
+
+
+def plot_projection_autocrop(
+    img: np.ndarray,
+    roi: Tuple[int, int, int, int],
+    diagnostics: Dict[str, float],
+    path: str,
+) -> None:
+    """Save a diagnostic plot for the rough-zone projection autocrop."""
+    from matplotlib.patches import Rectangle
+
+    x0, y0, w, h = roi
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.imshow(img, cmap="gray", origin="upper")
+    rect = Rectangle(
+        (x0, y0),
+        w,
+        h,
+        fill=False,
+        edgecolor="#00E5FF",
+        linewidth=1.8,
+    )
+    ax.add_patch(rect)
+    ax.axvline(diagnostics["left_x"], color="tab:orange", linestyle="--", linewidth=1.0)
+    ax.axvline(diagnostics["right_x"], color="tab:orange", linestyle="--", linewidth=1.0)
+    ax.axhline(diagnostics["top_y"], color="tab:green", linestyle="--", linewidth=1.0)
+    ax.axhline(diagnostics["bottom_y"], color="tab:green", linestyle="--", linewidth=1.0)
+    ax.set_title("Projection-based square autocrop")
+    fig.tight_layout()
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
+
+
+def analyze_auto_squares(
+    img: np.ndarray,
+    outdir: str,
+    group: Optional[int] = None,
+    element: Optional[int] = None,
+    lpmm: Optional[float] = None,
+    calibration: Optional[CameraCalibration] = None,
+    polarity: str = "dark",
+    min_area: int = 20,
+    max_aspect_error: float = 0.35,
+    min_fill_fraction: float = 0.25,
+    max_squares: Optional[int] = 50,
+    bg_sigma: float = 40.0,
+) -> pd.DataFrame:
+    """Detect and analyze visible USAF square targets in the image."""
+    ensure_dir(outdir)
+    if calibration is None:
+        calibration = CameraCalibration()
+    if lpmm is None and group is not None:
+        lpmm = usaf_square_lpmm(group)
+
+    square_side_um = nominal_usaf_square_side_um_from_lpmm(lpmm)
+    if not np.isfinite(square_side_um):
+        raise ValueError(
+            "Auto-square detection requires --group or --lpmm so the standard "
+            "USAF square side length is known."
+        )
+    expected_side_px = nominal_usaf_square_side_px_from_lpmm(lpmm, calibration)
+
+    squares, debug = detect_usaf_squares(
+        img=img,
+        polarity=polarity,
+        expected_side_px=expected_side_px if np.isfinite(expected_side_px) else None,
+        min_area=min_area,
+        max_aspect_error=max_aspect_error,
+        min_fill_fraction=min_fill_fraction,
+        max_squares=max_squares,
+        bg_sigma=bg_sigma,
+        verbose=True,
+    )
+
+    labels = [str(i) for i in range(len(squares))]
+    plot_detected_squares(
+        img,
+        squares,
+        os.path.join(outdir, "auto_detected_squares.png"),
+        labels=labels,
+        title="Detected USAF squares (unified labels)",
+    )
+
+    plt.figure(figsize=(8, 6))
+    plt.imshow(debug["mask"], cmap="gray", origin="upper")
+    plt.title(f"Segmentation mask, polarity={debug['polarity']}")
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, "auto_square_segmentation_mask.png"), dpi=200)
+    plt.close()
+
+    rows = []
+    for i, s in enumerate(squares):
+        square_dir = os.path.join(outdir, f"square_{i:03d}")
+        calibration_one = calibration
+        if calibration.object_pixel_um is None and np.isfinite(s.side_px) and s.side_px > 0:
+            calibration_one = calibration_with_object_pixel_um(
+                calibration,
+                square_side_um / s.side_px,
+            )
+        df_one = analyze_square_roi(
+            img=img,
+            roi=s.roi,
+            outdir=square_dir,
+            group=group,
+            element=element,
+            lpmm=lpmm,
+            calibration=calibration_one,
+            angle_deg=0.0,
+        )
+        row = df_one.iloc[0].to_dict()
+        row.update({
+            "auto_index": i,
+            "display_label": str(i),
+            "detection_score": s.score,
+            "detected_side_px": s.side_px,
+            "detected_bbox": str(s.bbox),
+            "detected_component_id": s.component_id,
+            "detected_polarity": s.polarity,
+            "detected_center_x": s.cx,
+            "detected_center_y": s.cy,
+            "detected_area": s.area,
+            "detected_fill_fraction": s.fill_fraction,
+            "detected_aspect_ratio": s.aspect_ratio,
+            "output_dir": square_dir,
+        })
+        rows.append(row)
+
+    summary = pd.DataFrame(rows)
+    summary_path = os.path.join(outdir, "auto_squares_summary.csv")
+    summary.to_csv(summary_path, index=False)
+
+    print("\nAuto square summary:")
+    if len(summary) > 0:
+        cols = [
+            "auto_index",
+            "display_label",
+            "roi_x",
+            "roi_y",
+            "roi_w",
+            "roi_h",
+            "square_side_px",
+            "horizontal_conv_sigma_um",
+            "horizontal_conv_rayleigh_equivalent_resolution_um",
+            "vertical_conv_sigma_um",
+            "vertical_conv_rayleigh_equivalent_resolution_um",
+            "detection_score",
+        ]
+        cols = [c for c in cols if c in summary.columns]
+        print(summary[cols].to_string(index=False))
+    else:
+        print("No square targets detected.")
+
+    print(f"\nSaved summary to: {summary_path}")
+    return summary
+
+
+# ============================================================
 # Edge / square analysis
 # ============================================================
 
@@ -3322,87 +4238,301 @@ def analyze_square_roi(
     img: np.ndarray,
     roi: Tuple[int, int, int, int],
     outdir: str,
+    group: Optional[int] = None,
+    element: Optional[int] = None,
+    lpmm: Optional[float] = None,
     calibration: Optional[CameraCalibration] = None,
     angle_deg: float = 0.0,
-    edge_window_px: int = 30,
-    central_fraction: float = 0.6,
+    auto_rotate: bool = False,
+    auto_rotate_max_deg: float = 8.0,
+    auto_rotate_step_deg: float = 0.5,
+    reported_angle_deg: Optional[float] = None,
+    reported_auto_rotation_angle_deg: float = 0.0,
+    reported_auto_rotation_score: float = np.nan,
 ) -> pd.DataFrame:
     """
-    Analyze a full square ROI.
+    Analyze a full USAF square ROI with a fixed nominal square side length.
 
-    The ROI should contain the full square plus margin. The code detects four
-    edges and fits each one.
+    The x projection reports the horizontal-axis blur sigma, and the y
+    projection reports the vertical-axis blur sigma.
     """
     ensure_dir(outdir)
 
     square = crop_roi(img, roi, angle_deg=angle_deg)
-    save_crop_plot(square, os.path.join(outdir, "square_roi.png"), "Square ROI")
-
-    h, w = square.shape
-
-    x_projection = square.mean(axis=0)
-    y_projection = square.mean(axis=1)
-
-    left_x, right_x = find_two_edge_positions_1d(x_projection)
-    top_y, bottom_y = find_two_edge_positions_1d(y_projection)
-
-    cx0 = int(w * (0.5 - central_fraction / 2))
-    cx1 = int(w * (0.5 + central_fraction / 2))
-    cy0 = int(h * (0.5 - central_fraction / 2))
-    cy1 = int(h * (0.5 + central_fraction / 2))
-
-    edge_results = []
-
-    def edge_crop_vertical(x_center: int, name: str):
-        x0 = max(0, x_center - edge_window_px)
-        x1 = min(w, x_center + edge_window_px)
-        sub = square[cy0:cy1, x0:x1]
-
-        return analyze_edge_array(
-            sub,
-            orientation="vertical",
-            calibration=calibration,
-            edge_name=name,
-            outdir=outdir,
+    local_auto_rotation_angle_deg = 0.0
+    local_auto_rotation_score = np.nan
+    if auto_rotate:
+        local_auto_rotation_angle_deg, local_auto_rotation_score = estimate_square_rotation_angle(
+            square,
+            max_angle_deg=auto_rotate_max_deg,
+            step_deg=auto_rotate_step_deg,
+        )
+        square = _rotate_crop_for_analysis(square, local_auto_rotation_angle_deg)
+        print(
+            "Auto square rotation: "
+            f"{local_auto_rotation_angle_deg:.4g} deg "
+            f"(score={local_auto_rotation_score:.4g})"
         )
 
-    def edge_crop_horizontal(y_center: int, name: str):
-        y0 = max(0, y_center - edge_window_px)
-        y1 = min(h, y_center + edge_window_px)
-        sub = square[y0:y1, cx0:cx1]
+    total_auto_rotation_angle_deg = (
+        reported_auto_rotation_angle_deg + local_auto_rotation_angle_deg
+    )
+    total_auto_rotation_score = (
+        local_auto_rotation_score
+        if np.isfinite(local_auto_rotation_score)
+        else reported_auto_rotation_score
+    )
+    analysis_angle_deg = (
+        reported_angle_deg
+        if reported_angle_deg is not None
+        else angle_deg + local_auto_rotation_angle_deg
+    )
+    save_crop_plot(
+        square,
+        os.path.join(outdir, "square_roi.png"),
+        f"Square ROI - {format_usaf_label(group, square=True)}",
+    )
 
-        return analyze_edge_array(
-            sub,
-            orientation="horizontal",
-            calibration=calibration,
-            edge_name=name,
-            outdir=outdir,
+    if calibration is None:
+        calibration = CameraCalibration()
+
+    if lpmm is None and group is not None:
+        lpmm = usaf_square_lpmm(group)
+
+    square_side_um = nominal_usaf_square_side_um_from_lpmm(lpmm)
+    square_side_px = nominal_usaf_square_side_px_from_lpmm(lpmm, calibration)
+    if not np.isfinite(square_side_px) and np.isfinite(square_side_um):
+        try:
+            _projection_roi, projection_diag = autocrop_square_roi_from_projection(
+                square,
+                expected_side_px=None,
+            )
+            measured_side_px = projection_diag["measured_side_px"]
+            if np.isfinite(measured_side_px) and measured_side_px > 0:
+                inferred_object_pixel_um = square_side_um / measured_side_px
+                calibration = calibration_with_object_pixel_um(
+                    calibration,
+                    inferred_object_pixel_um,
+                )
+                square_side_px = nominal_usaf_square_side_px_from_lpmm(lpmm, calibration)
+                print(
+                    "Inferred object-space pixel size from group square: "
+                    f"{inferred_object_pixel_um:.6g} um/pixel"
+                )
+        except Exception:
+            pass
+    square_side_source = "group_or_lpmm_calibration" if np.isfinite(square_side_px) else "none"
+    if not np.isfinite(square_side_px):
+        raise ValueError(
+            "Square mode requires --group or --lpmm so the standard USAF "
+            "square side length is known."
         )
 
-    edge_results.append(edge_crop_vertical(left_x, "left_edge"))
-    edge_results.append(edge_crop_vertical(right_x, "right_edge"))
-    edge_results.append(edge_crop_horizontal(top_y, "top_edge"))
-    edge_results.append(edge_crop_horizontal(bottom_y, "bottom_edge"))
+    try:
+        _profile_roi, profile_diag = autocrop_square_roi_from_projection(
+            square,
+            expected_side_px=square_side_px,
+        )
+    except Exception:
+        profile_diag = {
+            "center_x": 0.5 * (square.shape[1] - 1),
+            "center_y": 0.5 * (square.shape[0] - 1),
+        }
 
-    df = pd.DataFrame(edge_results)
-    df.insert(0, "mode", "square")
-    df.insert(1, "angle_deg", angle_deg)
+    band_fraction = 0.60
+    band_width_px = max(3, int(round(band_fraction * square_side_px)))
+    center_x = float(profile_diag["center_x"])
+    center_y = float(profile_diag["center_y"])
+    x_band0 = max(0, int(round(center_x - 0.5 * band_width_px)))
+    x_band1 = min(square.shape[1], int(round(center_x + 0.5 * band_width_px)))
+    y_band0 = max(0, int(round(center_y - 0.5 * band_width_px)))
+    y_band1 = min(square.shape[0], int(round(center_y + 0.5 * band_width_px)))
+    if x_band1 <= x_band0:
+        x_band0, x_band1 = 0, square.shape[1]
+    if y_band1 <= y_band0:
+        y_band0, y_band1 = 0, square.shape[0]
 
-    df.to_csv(os.path.join(outdir, "square_edges_result.csv"), index=False)
+    x_profile = square[y_band0:y_band1, :].mean(axis=0)
+    y_profile = square[:, x_band0:x_band1].mean(axis=1)
+    horizontal_fit = fit_single_square_axis_profile(
+        x_profile,
+        fixed_side_px=square_side_px,
+        pixel_size_um=calibration.object_pixel_um,
+    )
+    vertical_fit = fit_single_square_axis_profile(
+        y_profile,
+        fixed_side_px=square_side_px,
+        pixel_size_um=calibration.object_pixel_um,
+    )
 
-    plt.figure(figsize=(6, 5))
-    plt.imshow(square, cmap="gray", origin="upper")
-    plt.axvline(left_x, linestyle="--", label="left edge")
-    plt.axvline(right_x, linestyle="--", label="right edge")
-    plt.axhline(top_y, linestyle=":", label="top edge")
-    plt.axhline(bottom_y, linestyle=":", label="bottom edge")
-    plt.legend()
-    plt.title("Detected square edges")
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, "square_detected_edges.png"), dpi=200)
-    plt.close()
+    if lpmm is not None:
+        res = resolution_from_lpmm(lpmm)
+    else:
+        res = {
+            "lp_per_mm": np.nan,
+            "line_pair_period_um": np.nan,
+            "half_pitch_um": np.nan,
+        }
 
-    print("\nSquare edge analysis result:")
+    def prefixed_fit(prefix: str, fit: Dict[str, object]) -> Dict[str, object]:
+        return {
+            f"{prefix}_{key}": value
+            for key, value in fit.items()
+            if key not in ("conv_fit_profile", "conv_ideal_profile")
+        }
+
+    result = {
+        "mode": "square",
+        "roi_x": roi[0],
+        "roi_y": roi[1],
+        "roi_w": roi[2],
+        "roi_h": roi[3],
+        "orientation": "square",
+        "angle_deg": analysis_angle_deg,
+        "input_angle_deg": angle_deg,
+        "auto_rotation_angle_deg": total_auto_rotation_angle_deg,
+        "auto_rotation_score": total_auto_rotation_score,
+        "psf_model": "gaussian",
+        "group": group,
+        "element": element,
+        "lp_per_mm": res["lp_per_mm"],
+        "line_pair_period_um": res["line_pair_period_um"],
+        "half_pitch_um": res["half_pitch_um"],
+        "period_px": (
+            res["line_pair_period_um"] / calibration.object_pixel_um
+            if np.isfinite(res["line_pair_period_um"])
+            and calibration.object_pixel_um is not None
+            and calibration.object_pixel_um > 0
+            else np.nan
+        ),
+        "nominal_w_px": square_side_px,
+        "nominal_width_source": square_side_source,
+        "nominal_width_bound_lower_px": square_side_px,
+        "nominal_width_bound_upper_px": square_side_px,
+        "square_side_px": square_side_px,
+        "square_side_um": square_side_um,
+        "square_side_mm": square_side_um / 1000.0 if np.isfinite(square_side_um) else np.nan,
+        "square_side_bar_widths": USAF_SQUARE_SIDE_BAR_WIDTHS,
+        "profile_band_axis": "xy",
+        "profile_band_start_px": 0,
+        "profile_band_end_px": np.nan,
+        "profile_band_fraction": 1.0,
+        "profile_band_trim_applied": False,
+        "horizontal_profile_band_axis": "y",
+        "horizontal_profile_band_start_px": y_band0,
+        "horizontal_profile_band_end_px": y_band1,
+        "vertical_profile_band_axis": "x",
+        "vertical_profile_band_start_px": x_band0,
+        "vertical_profile_band_end_px": x_band1,
+        "square_profile_band_fraction": band_fraction,
+    }
+    result.update(prefixed_fit("horizontal", horizontal_fit))
+    result.update(prefixed_fit("vertical", vertical_fit))
+
+    df = pd.DataFrame([result])
+    df.to_csv(os.path.join(outdir, "square_result.csv"), index=False)
+
+    fig, axes = plt.subplots(2, 2, figsize=(9, 6))
+    axes[0, 0].imshow(square, cmap="gray", origin="upper")
+    axes[0, 0].set_title("Square ROI")
+    axes[0, 0].axhspan(y_band0, y_band1, facecolor="tab:orange", alpha=0.12)
+    axes[0, 0].axvspan(x_band0, x_band1, facecolor="tab:green", alpha=0.12)
+    axes[0, 0].axvline(horizontal_fit["conv_x0_px"], color="tab:orange", linestyle="--")
+    axes[0, 0].axhline(vertical_fit["conv_x0_px"], color="tab:green", linestyle="--")
+
+    axis_specs = [
+        (axes[0, 1], x_profile, horizontal_fit, "horizontal", "x position"),
+        (axes[1, 0], y_profile, vertical_fit, "vertical", "y position"),
+    ]
+    for ax, profile, fit, label, xlabel in axis_specs:
+        x_axis = np.arange(len(profile), dtype=float)
+        plot_x = x_axis
+        x_label = f"{xlabel} (pixel)"
+        if calibration.object_pixel_um is not None and calibration.object_pixel_um > 0:
+            plot_x = x_axis * calibration.object_pixel_um
+            x_label = f"{xlabel} (object-space um)"
+        ax.plot(plot_x, profile, "o", markersize=3, label="measured profile")
+        if fit["conv_fit_success"]:
+            x_dense = np.linspace(x_axis[0], x_axis[-1], 1200)
+            plot_x_dense = x_dense
+            if calibration.object_pixel_um is not None and calibration.object_pixel_um > 0:
+                plot_x_dense = x_dense * calibration.object_pixel_um
+            ideal_profile_dense = (
+                fit["conv_background_offset"]
+                + fit["conv_background_slope_per_px"] * x_dense
+                + fit["conv_amplitude"]
+                * (np.abs(x_dense - fit["conv_x0_px"]) < 0.5 * fit["conv_w_px"]).astype(float)
+            )
+            fit_profile_dense = (
+                fit["conv_background_offset"]
+                + fit["conv_background_slope_per_px"] * x_dense
+                + fit["conv_amplitude"]
+                * blurred_bar_profile(
+                    x_dense,
+                    fit["conv_x0_px"],
+                    fit["conv_w_px"],
+                    fit["conv_sigma_px"],
+                )
+            )
+            ax.plot(
+                plot_x_dense,
+                ideal_profile_dense,
+                ":",
+                color="0.35",
+                label="unblurred square",
+            )
+            ax.plot(
+                plot_x_dense,
+                fit_profile_dense,
+                "-",
+                color="tab:orange",
+                linewidth=2.0,
+                label="Gaussian fit",
+            )
+            sigma_key = "conv_sigma_um" if np.isfinite(fit["conv_sigma_um"]) else "conv_sigma_px"
+            unc_key = (
+                "conv_sigma_uncertainty_um"
+                if sigma_key == "conv_sigma_um"
+                else "conv_sigma_uncertainty_px"
+            )
+            unit = "um" if sigma_key == "conv_sigma_um" else "px"
+            res_key = (
+                "conv_rayleigh_equivalent_resolution_um"
+                if unit == "um"
+                else "conv_rayleigh_equivalent_resolution_px"
+            )
+            res_unc_key = (
+                "conv_rayleigh_equivalent_resolution_uncertainty_um"
+                if unit == "um"
+                else "conv_rayleigh_equivalent_resolution_uncertainty_px"
+            )
+            sigma_text = format_value_with_uncertainty(fit[sigma_key], fit[unc_key])
+            resolution_text = format_value_with_uncertainty(fit[res_key], fit[res_unc_key])
+            ax.set_title(
+                f"{label}: sigma={sigma_text} {unit}, "
+                f"resolution={resolution_text} {unit}"
+            )
+        else:
+            ax.set_title(f"{label} fit failed: {fit['conv_fit_message']}")
+        ax.set_xlabel(x_label)
+        ax.set_ylabel("intensity counts")
+        ax.legend(loc="best")
+
+    axes[1, 1].axis("off")
+    axes[1, 1].text(
+        0.0,
+        0.9,
+        "Gaussian square fit\n"
+        f"{format_usaf_label(group, square=True)}\n"
+        f"fixed side = {square_side_um:.4g} um\n"
+        "Rayleigh-equivalent resolution = 2.898785 sigma",
+        va="top",
+    )
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, "square_psf_fit.png"), dpi=200)
+    plt.close(fig)
+
+    print("\nSquare analysis result:")
     print(df.to_string(index=False))
 
     return df
@@ -3419,7 +4549,10 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--roi",
         default=None,
-        help="ROI as x,y,w,h. If omitted, interactive selector is used for manual modes.",
+        help=(
+            "ROI as x,y,w,h. For square mode this is a rough search zone that "
+            "will be auto-cropped unless --manual-roi is used."
+        ),
     )
     parser.add_argument("--outdir", default="analysis_output", help="Output directory.")
     parser.add_argument(
@@ -3432,7 +4565,19 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         "--pixel-size-um",
         type=float,
         default=None,
-        help="Camera physical pixel size in um.",
+        help=(
+            "Pixel size in um. If --magnification is omitted, this is treated "
+            "as object-space um/image pixel; otherwise it is camera pixel size."
+        ),
+    )
+    parser.add_argument(
+        "--object-pixel-size-um",
+        type=float,
+        default=None,
+        help=(
+            "Direct calibrated object-space pixel size in um/image pixel. "
+            "Overrides --pixel-size-um/--magnification."
+        ),
     )
     parser.add_argument(
         "--magnification",
@@ -3504,6 +4649,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-auto-trim-profile-band",
         action="store_true",
         help="Disable automatic trimming of the stripe-direction averaging band.",
+    )
+    p_stripe.set_defaults(auto_rotate=True)
+    p_stripe.add_argument(
+        "--auto-rotate",
+        dest="auto_rotate",
+        action="store_true",
+        help="Automatically estimate and correct small ROI rotation before fitting.",
+    )
+    p_stripe.add_argument(
+        "--no-auto-rotate",
+        dest="auto_rotate",
+        action="store_false",
+        help="Disable automatic ROI rotation correction.",
+    )
+    p_stripe.add_argument(
+        "--auto-rotate-max-deg",
+        type=float,
+        default=8.0,
+        help="Maximum absolute angle searched by automatic rotation correction.",
+    )
+    p_stripe.add_argument(
+        "--auto-rotate-step-deg",
+        type=float,
+        default=0.5,
+        help="Angle step for automatic rotation correction.",
     )
 
     # Auto-stripes mode.
@@ -3597,6 +4767,65 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # Auto-squares mode.
+    p_auto_square = subparsers.add_parser(
+        "auto-squares",
+        help="Automatically detect and analyze multiple USAF square targets.",
+    )
+    add_common_args(p_auto_square)
+    p_auto_square.add_argument("--group", type=int, default=None, help="USAF group number.")
+    p_auto_square.add_argument(
+        "--element",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    p_auto_square.add_argument(
+        "--lpmm",
+        type=float,
+        default=None,
+        help="Spatial frequency in lp/mm. Overrides group/element if provided.",
+    )
+    p_auto_square.add_argument(
+        "--polarity",
+        choices=["dark", "bright", "auto"],
+        default="dark",
+        help=(
+            "Square polarity. Use dark for dark squares on bright background; "
+            "bright for bright squares on dark background; auto to choose automatically."
+        ),
+    )
+    p_auto_square.add_argument(
+        "--min-area",
+        type=int,
+        default=20,
+        help="Minimum connected-component area for a square candidate.",
+    )
+    p_auto_square.add_argument(
+        "--max-aspect-error",
+        type=float,
+        default=0.35,
+        help="Maximum allowed deviation of square component aspect ratio from 1.",
+    )
+    p_auto_square.add_argument(
+        "--min-fill-fraction",
+        type=float,
+        default=0.25,
+        help="Minimum foreground fill fraction inside a candidate bounding box.",
+    )
+    p_auto_square.add_argument(
+        "--max-squares",
+        type=int,
+        default=50,
+        help="Maximum number of detected square targets to analyze.",
+    )
+    p_auto_square.add_argument(
+        "--bg-sigma",
+        type=float,
+        default=40.0,
+        help="Gaussian sigma for slow-background normalization.",
+    )
+
     # Edge mode.
     p_edge = subparsers.add_parser(
         "edge",
@@ -3617,21 +4846,95 @@ def build_parser() -> argparse.ArgumentParser:
     # Square mode.
     p_square = subparsers.add_parser(
         "square",
-        help="Analyze full square ROI and fit four edges.",
+        help="Analyze one USAF square ROI with fixed side length and Gaussian PSF fits.",
     )
     add_common_args(p_square)
 
     p_square.add_argument(
-        "--edge-window-px",
+        "--group",
         type=int,
-        default=30,
-        help="Half-window size around each detected edge.",
+        default=None,
+        help="USAF group number.",
     )
     p_square.add_argument(
-        "--central-fraction",
+        "--element",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    p_square.add_argument(
+        "--lpmm",
         type=float,
-        default=0.6,
-        help="Central fraction used to avoid square corners.",
+        default=None,
+        help="Spatial frequency in lp/mm. Overrides group/element if provided.",
+    )
+    p_square.add_argument(
+        "--auto-roi",
+        action="store_true",
+        help=(
+            "Deprecated: square mode now auto-crops the best square inside the "
+            "rough selected ROI by default."
+        ),
+    )
+    p_square.add_argument(
+        "--manual-roi",
+        action="store_true",
+        help="Use the manual/interactive ROI selector instead of automatic square ROI detection.",
+    )
+    p_square.add_argument(
+        "--polarity",
+        choices=["dark", "bright", "auto"],
+        default="dark",
+        help=argparse.SUPPRESS,
+    )
+    p_square.add_argument(
+        "--min-area",
+        type=int,
+        default=20,
+        help=argparse.SUPPRESS,
+    )
+    p_square.add_argument(
+        "--max-aspect-error",
+        type=float,
+        default=0.35,
+        help=argparse.SUPPRESS,
+    )
+    p_square.add_argument(
+        "--min-fill-fraction",
+        type=float,
+        default=0.25,
+        help=argparse.SUPPRESS,
+    )
+    p_square.add_argument(
+        "--bg-sigma",
+        type=float,
+        default=40.0,
+        help=argparse.SUPPRESS,
+    )
+    p_square.set_defaults(auto_rotate=True)
+    p_square.add_argument(
+        "--auto-rotate",
+        dest="auto_rotate",
+        action="store_true",
+        help="Automatically estimate and correct small square rotation before autocropping/fitting.",
+    )
+    p_square.add_argument(
+        "--no-auto-rotate",
+        dest="auto_rotate",
+        action="store_false",
+        help="Disable automatic square rotation correction.",
+    )
+    p_square.add_argument(
+        "--auto-rotate-max-deg",
+        type=float,
+        default=8.0,
+        help="Maximum absolute angle searched by automatic rotation correction.",
+    )
+    p_square.add_argument(
+        "--auto-rotate-step-deg",
+        type=float,
+        default=0.5,
+        help="Angle step for automatic rotation correction.",
     )
 
     return parser
@@ -3651,6 +4954,7 @@ def main() -> None:
         pixel_size_um=args.pixel_size_um,
         magnification=args.magnification,
         binning=args.binning,
+        object_pixel_size_um=args.object_pixel_size_um,
     )
 
     if calibration.object_pixel_um is not None:
@@ -3676,6 +4980,9 @@ def main() -> None:
             fix_convolution_width=args.fix_convolution_width,
             psf_model=args.psf_model,
             auto_trim_profile_band=not args.no_auto_trim_profile_band,
+            auto_rotate=args.auto_rotate,
+            auto_rotate_max_deg=args.auto_rotate_max_deg,
+            auto_rotate_step_deg=args.auto_rotate_step_deg,
         )
 
     elif args.mode == "auto-stripes":
@@ -3714,6 +5021,39 @@ def main() -> None:
             auto_trim_profile_band=not args.no_auto_trim_profile_band,
         )
 
+    elif args.mode == "auto-squares":
+        # Optional --roi restricts the automatic search region.
+        if args.roi is not None:
+            search_roi = parse_roi(args.roi)
+            work_img = crop_roi(img, search_roi, angle_deg=args.angle_deg)
+            print(f"Auto-squares search restricted to ROI: {search_roi}")
+        else:
+            if args.angle_deg != 0:
+                work_img = rotate(
+                    img,
+                    args.angle_deg,
+                    reshape=False,
+                    order=1,
+                    mode="nearest",
+                )
+            else:
+                work_img = img
+
+        analyze_auto_squares(
+            img=work_img,
+            outdir=args.outdir,
+            group=args.group,
+            element=args.element,
+            lpmm=args.lpmm,
+            calibration=calibration,
+            polarity=args.polarity,
+            min_area=args.min_area,
+            max_aspect_error=args.max_aspect_error,
+            min_fill_fraction=args.min_fill_fraction,
+            max_squares=args.max_squares,
+            bg_sigma=args.bg_sigma,
+        )
+
     elif args.mode == "edge":
         roi = get_roi(img, args.roi, title="Select edge ROI")
 
@@ -3727,16 +5067,122 @@ def main() -> None:
         )
 
     elif args.mode == "square":
-        roi = get_roi(img, args.roi, title="Select full square ROI")
+        if not args.manual_roi:
+            search_roi = get_roi(
+                img,
+                args.roi,
+                title="Select rough square search zone",
+            )
+            work_img = crop_roi(img, search_roi, angle_deg=args.angle_deg)
+            print(f"Square auto-crop search zone: {search_roi}")
+
+            auto_rotation_angle_deg = 0.0
+            auto_rotation_score = np.nan
+            if args.auto_rotate:
+                auto_rotation_angle_deg, auto_rotation_score = estimate_square_rotation_angle(
+                    work_img,
+                    max_angle_deg=args.auto_rotate_max_deg,
+                    step_deg=args.auto_rotate_step_deg,
+                )
+                work_img = _rotate_crop_for_analysis(work_img, auto_rotation_angle_deg)
+                print(
+                    "Auto square rotation: "
+                    f"{auto_rotation_angle_deg:.4g} deg "
+                    f"(score={auto_rotation_score:.4g})"
+                )
+
+            lpmm = args.lpmm
+            if lpmm is None and args.group is not None:
+                lpmm = usaf_square_lpmm(args.group)
+            square_side_um = nominal_usaf_square_side_um_from_lpmm(lpmm)
+            if not np.isfinite(square_side_um):
+                raise ValueError(
+                    "square mode requires --group or --lpmm so the standard "
+                    "USAF square side length is known."
+                )
+            expected_side_px = nominal_usaf_square_side_px_from_lpmm(lpmm, calibration)
+
+            ensure_dir(args.outdir)
+            roi, autocrop_diag = autocrop_square_roi_from_projection(
+                work_img,
+                expected_side_px=expected_side_px if np.isfinite(expected_side_px) else None,
+            )
+            calibration_for_square = calibration
+            if calibration.object_pixel_um is None:
+                measured_side_px = autocrop_diag["measured_side_px"]
+                if not np.isfinite(measured_side_px) or measured_side_px <= 0:
+                    raise RuntimeError("Could not infer calibration from square projection.")
+                inferred_object_pixel_um = square_side_um / measured_side_px
+                calibration_for_square = calibration_with_object_pixel_um(
+                    calibration,
+                    inferred_object_pixel_um,
+                )
+                print(
+                    "Inferred object-space pixel size from group square: "
+                    f"{inferred_object_pixel_um:.6g} um/pixel"
+                )
+            plot_projection_autocrop(
+                work_img,
+                roi,
+                autocrop_diag,
+                os.path.join(args.outdir, "auto_detected_square_roi.png"),
+            )
+            img_for_square = work_img
+            angle_for_square = 0.0
+            reported_angle_for_square = args.angle_deg + auto_rotation_angle_deg
+            reported_auto_rotation_for_square = auto_rotation_angle_deg
+            reported_auto_rotation_score_for_square = auto_rotation_score
+            print(f"Auto-cropped square ROI inside search zone: {roi}")
+            print(
+                "Projection edge span: "
+                f"width={autocrop_diag['measured_width_px']:.4g} px, "
+                f"height={autocrop_diag['measured_height_px']:.4g} px"
+            )
+        else:
+            roi = get_roi(img, args.roi, title="Select full square ROI")
+            img_for_square = img
+            angle_for_square = args.angle_deg
+            reported_angle_for_square = None
+            reported_auto_rotation_for_square = 0.0
+            reported_auto_rotation_score_for_square = np.nan
+            calibration_for_square = calibration
+            lpmm = args.lpmm
+            if lpmm is None and args.group is not None:
+                lpmm = usaf_square_lpmm(args.group)
+            square_side_um = nominal_usaf_square_side_um_from_lpmm(lpmm)
+            if calibration.object_pixel_um is None and np.isfinite(square_side_um):
+                manual_crop = crop_roi(img_for_square, roi, angle_deg=angle_for_square)
+                _manual_roi, manual_diag = autocrop_square_roi_from_projection(
+                    manual_crop,
+                    expected_side_px=None,
+                )
+                measured_side_px = manual_diag["measured_side_px"]
+                if np.isfinite(measured_side_px) and measured_side_px > 0:
+                    inferred_object_pixel_um = square_side_um / measured_side_px
+                    calibration_for_square = calibration_with_object_pixel_um(
+                        calibration,
+                        inferred_object_pixel_um,
+                    )
+                    print(
+                        "Inferred object-space pixel size from group square: "
+                        f"{inferred_object_pixel_um:.6g} um/pixel"
+                    )
 
         analyze_square_roi(
-            img=img,
+            img=img_for_square,
             roi=roi,
             outdir=args.outdir,
-            calibration=calibration,
-            angle_deg=args.angle_deg,
-            edge_window_px=args.edge_window_px,
-            central_fraction=args.central_fraction,
+            group=args.group,
+            element=args.element,
+            lpmm=args.lpmm,
+            calibration=calibration_for_square,
+            angle_deg=angle_for_square,
+            auto_rotate=args.auto_rotate and args.manual_roi,
+            auto_rotate_max_deg=args.auto_rotate_max_deg,
+            auto_rotate_step_deg=args.auto_rotate_step_deg,
+            reported_angle_deg=reported_angle_for_square,
+            reported_auto_rotation_angle_deg=reported_auto_rotation_for_square,
+            reported_auto_rotation_score=reported_auto_rotation_score_for_square,
         )
 
     else:
